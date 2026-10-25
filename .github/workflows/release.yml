@@ -1,0 +1,51 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: macos-14
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Check tag matches app version
+      run: |
+        v=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Resources/Info.plist)
+        [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME != Info.plist v$v"; exit 1; }
+
+    - name: Compile and Bundle App
+      run: |
+        chmod +x ./build.sh
+        ./build.sh
+        # Run selftest to ensure clean binary
+        ./VibeDeck.app/Contents/MacOS/VibeDeck --selftest
+        /usr/bin/python3 Resources/vibedeck-proxy.py --selftest
+
+    - name: Package Zip
+      run: |
+        # Use ditto to preserve macOS metadata and code signatures
+        ditto -c -k --sequesterRsrc --keepParent VibeDeck.app VibeDeck.zip
+        shasum -a 256 VibeDeck.zip > VibeDeck.zip.sha256
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      with:
+        files: |
+          VibeDeck.zip
+          VibeDeck.zip.sha256
+        fail_on_unmatched_files: true
+        draft: false
+        prerelease: false
+        generate_release_notes: true

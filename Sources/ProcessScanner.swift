@@ -1,4 +1,51 @@
 import Foundation
+import os
+import Darwin
+
+// MARK: - File metadata
+
+/// Read only mtime / size / type, never extended attributes.
+///
+/// `FileManager.attributesOfItem` also fetches every xattr (including
+/// com.apple.provenance). On a wedged mount that `getxattr` can block forever,
+/// and this code runs inside the slow-scan lock: the whole scan stops and quotas
+/// are never published again. `stat(2)` returns only what the scanner needs.
+struct FileProbe {
+    let mtime: TimeInterval
+    let size: UInt64
+    let isDirectory: Bool
+}
+
+func vgFileStat(_ path: String, followSymlinks: Bool = true) -> FileProbe? {
+    var info = stat()
+    let result = path.withCString { followSymlinks ? stat($0, &info) : lstat($0, &info) }
+    guard result == 0 else { return nil }
+    return FileProbe(
+        mtime: TimeInterval(info.st_mtimespec.tv_sec) + TimeInterval(info.st_mtimespec.tv_nsec) / 1_000_000_000,
+        size: UInt64(max(0, info.st_size)),
+        isDirectory: (info.st_mode & S_IFMT) == S_IFDIR
+    )
+}
+
+// MARK: - 数据模型
+
+/// 一个候选孤儿进程：带完整命令行，供杀之前核对与在面板上预览
+public struct OrphanProc: Identifiable {
+    public var id: Int { pid }
+    public let pid: Int
+    public let cmd: String
+    public let memMB: Double
+    public let service: String
+}
+
+/// 被规则放过的进程 + 放过的原因（面板上要能说清"为什么没动它"）
+public struct ProtectedProc: Identifiable {
+    public var id: Int { pid }
+    public let pid: Int
+    public let cmd: String
+    public let memMB: Double
+    public let reason: String
+}
 
 public struct ServiceGroup: Identifiable {
     public var id: String { serviceName }
@@ -8,92 +55,308 @@ public struct ServiceGroup: Identifiable {
     public var pids: [Int]
 }
 
+/// 一次 API 调用（同一 requestId 在 jsonl 里会写多行，按 requestId 去重后才是"一轮"）
 public struct InteractionRecord: Identifiable, Equatable {
     public var id: String
     public var model: String
     public var timestamp: TimeInterval
-    public var secondsAgo: Int
     public var contextTokens: Int
+    public var cacheReadTokens: Int
     public var outputTokens: Int
     public var thinkingTokens: Int
-    public var cacheHitRate: Double
-    
-    public init(
-        id: String = UUID().uuidString,
-        model: String = "",
-        timestamp: TimeInterval = 0,
-        secondsAgo: Int = 0,
-        contextTokens: Int = 0,
-        outputTokens: Int = 0,
-        thinkingTokens: Int = 0,
-        cacheHitRate: Double = 0.0
-    ) {
-        self.id = id
-        self.model = model
-        self.timestamp = timestamp
-        self.secondsAgo = secondsAgo
-        self.contextTokens = contextTokens
-        self.outputTokens = outputTokens
-        self.thinkingTokens = thinkingTokens
-        self.cacheHitRate = cacheHitRate
+
+    public var cacheHitRate: Double {
+        contextTokens > 0 ? Double(cacheReadTokens) / Double(contextTokens) * 100.0 : 0.0
     }
 }
 
-public struct TokenStats {
-    public var latestModel: String = ""
-    public var latestContext: Int = 0
-    public var latestCacheHitRate: Double = 0.0
-    public var latestOutput: Int = 0
-    public var latestThinking: Int = 0
-    public var latestSecondsAgo: Int = 0
-    public var latestTimestamp: TimeInterval = 0
-    public var isActive: Bool = false
-    
-    // 最近交互流水 (最多保留 3 轮)
+/// 今日消耗按项目（工作目录）归因
+public struct ProjectUsage: Identifiable, Equatable {
+    public var id: String { path }
+    public let path: String
+    public var turns: Int = 0
+    public var ctx: Int64 = 0
+    public var out: Int64 = 0
+    public var think: Int64 = 0
+    public var clis: [String] = []          // 哪些 CLI 在这个目录里干过活
+    /// 末级目录名，面板上显示用
+    public var name: String { path.split(separator: "/").last.map(String.init) ?? path }
+}
+
+public struct TokenStats: Equatable {
+    /// 最近 3 轮（跨所有会话，按时间倒序）
     public var recentInteractions: [InteractionRecord] = []
-    
-    public var turns5h: Int = 0
-    public var context5h: Int64 = 0
-    public var output5h: Int64 = 0
-    
+
+    /// 今日 = 本地日历日（按每轮 timestamp 归类，不按文件 mtime）
     public var todayTurns: Int = 0
     public var todayContext: Int64 = 0
     public var todayCacheRead: Int64 = 0
     public var todayOutput: Int64 = 0
     public var todayThinking: Int64 = 0
     public var todayCacheHitRate: Double {
-        todayContext > 0 ? (Double(todayCacheRead) / Double(todayContext)) * 100.0 : 0.0
+        todayContext > 0 ? Double(todayCacheRead) / Double(todayContext) * 100.0 : 0.0
     }
-    
-    // 服务端真实下发的订阅配额百分比 (Claude Max/Pro 独有)
-    public var fiveHourPct: Int? = nil
-    public var sevenDayPct: Int? = nil
+
+    /// 今日按项目归因（按上下文 token 降序）
+    public var todayByProject: [ProjectUsage] = []
+}
+
+/// 某个 CLI 今日自己的用量（各家日志能给多少就给多少，给不了的说明原因）
+public struct CLIUsage: Identifiable {
+    public var id: String { name }
+    public let name: String
+    public var requests: Int = 0
+    public var ctx: Int64 = 0
+    public var cacheRead: Int64 = 0
+    public var out: Int64 = 0
+    public var think: Int64 = 0
+    public var turns: Int = 0
+    public var note: String = ""          // 非空 = 本地拿不到 token，只能给这句说明
+    public var hasTokens: Bool { ctx > 0 || out > 0 }
+    public var cacheHitRate: Double { ctx > 0 ? Double(cacheRead) / Double(ctx) * 100.0 : 0.0 }
+}
+
+/// 一个额度窗口（5h / 周）：已用百分比 + 重置点 + 数据采集时间
+/// 按当前速度推算的燃烧情况
+public struct Burn: Equatable {
+    public let pctPerHour: Double
+    /// 照这个速度，到重置点会用到百分之多少（可能 >100）
+    public let projectedAtReset: Int
+    /// 预计打满的时刻；nil = 到重置也用不完
+    public let exhaustAt: TimeInterval?
+    /// 这个速度是怎么来的（界面要说清口径）："近 42 分钟" / "本窗口均"
+    public let basis: String
+    public var isRecent: Bool { basis.hasPrefix("近") }
+}
+
+public struct QuotaWindow: Equatable {
+    public var usedPct: Int
+    public var resetsAt: TimeInterval?
+    public var capturedAt: TimeInterval?
+    /// 这个窗口有多长（5h = 18000，周 = 604800）。0 = 不知道 → 不推算，不瞎猜
+    public var windowSeconds: Double = 0
+    /// 近期速度（本工具自己记的额度采样算出来的，%/小时）。0 = 还没攒够样本
+    public var recentPctPerHour: Double = 0
+    public var recentSpanMinutes: Int = 0
+    /// Keep fractional provider measurements for equivalent-USD capacity, without changing rounded UI labels.
+    public var rawUsedPercent: Double? = nil
+    public var accountingUsedPercent: Double { rawUsedPercent ?? Double(usedPct) }
+
+    public func isExpired(now: TimeInterval = Date().timeIntervalSince1970) -> Bool {
+        guard let r = resetsAt else { return false }
+        return now >= r
+    }
+
+    /// 过了重置点 → 缓存里的旧值作废，视为 0%
+    public func effectivePct(now: TimeInterval = Date().timeIntervalSince1970) -> Int {
+        isExpired(now: now) ? 0 : usedPct
+    }
+
+    public func ageSeconds(now: TimeInterval = Date().timeIntervalSince1970) -> Int? {
+        capturedAt.map { max(0, Int(now - $0)) }
+    }
+
+    /// 燃烧速率。两种口径，优先用"近期"：
+    /// - **近期**：本工具自己记的额度采样（近 1 小时内的两点差），反映"当前节奏"，猛用时立刻跟上
+    /// - **窗口均**：本窗口迄今的平均速度（不用任何历史，窗口长度与重置点就够）
+    /// 窗口刚开头不足 15 分钟、没窗口长度、已过重置、已经打满 → 一律不推算。
+    public func burn(now: TimeInterval = Date().timeIntervalSince1970) -> Burn? {
+        guard windowSeconds > 0, let reset = resetsAt else { return nil }
+        let remaining = reset - now
+        guard remaining > 0 else { return nil }                       // 已过重置点，旧值作废
+        let elapsed = windowSeconds - remaining
+        let pct = Double(effectivePct(now: now))
+        guard pct < 100 else { return nil }                           // 已经打满了就没什么可推算的
+
+        var perHour: Double
+        var basis: String
+        if recentPctPerHour > 0, recentSpanMinutes >= 10 {
+            perHour = recentPctPerHour
+            basis = "近 \(recentSpanMinutes) 分钟"
+        } else {
+            guard elapsed >= 900, pct > 0 else { return nil }
+            perHour = pct / (elapsed / 3600)
+            basis = "本窗口均"
+        }
+        let projected = pct + perHour * (remaining / 3600)
+        let exhaust: TimeInterval? = projected >= 100 && perHour > 0 ? now + (100 - pct) / perHour * 3600 : nil
+        return Burn(pctPerHour: perHour, projectedAtReset: Int(projected.rounded()), exhaustAt: exhaust, basis: basis)
+    }
+}
+
+public struct SubQuota: Identifiable {
+    public var id: String { name }
+    public let name: String
+    public let window: QuotaWindow
+    public init(name: String, window: QuotaWindow) {
+        self.name = name
+        self.window = window
+    }
+}
+
+/// 一个活跃 CLI 会话（详情页列出来：在哪个目录、跑了多久）
+public struct SessionInfo: Identifiable {
+    public var id: Int { pid }
+    public let pid: Int
+    public let cwd: String
+    public let startedAgo: Int      // 秒
+    public let memMB: Double
+}
+
+/// 详情页用的补充信息：平台级的订阅/账号/来源字段（只放本地文件里真实存在的，邮箱类一律不取）
+public struct PlatformDetail {
+    public var rows: [(String, String)] = []        // 展示用键值对
+    public var sessions: [SessionInfo] = []
+    /// Device-scoped process/turn evidence; Codex app-server is not a single session.
+    public var codexProcesses: [CodexProcessInfo] = []
+    public var sourceFiles: [String] = []           // 数据来自哪些文件
+    public var extraPools: [(String, QuotaWindow)] = []   // 主卡没显示的桶（如 Codex Spark）
 }
 
 public struct DetectedLLMRuntime: Identifiable {
     public var id: String { name }
     public let name: String
-    public let provider: String
     public let isRunning: Bool
     public let tier: String
     public let detail: String
-    public var fiveHourPct: Int? = nil
-    public var sevenDayPct: Int? = nil
+    public var fiveHour: QuotaWindow? = nil
+    public var sevenDay: QuotaWindow? = nil
     public var secondaryPoolName: String = ""
-    public var secondaryFiveHourPct: Int? = nil
-    public var secondarySevenDayPct: Int? = nil
+    public var secondaryFiveHour: QuotaWindow? = nil
+    public var secondarySevenDay: QuotaWindow? = nil
     public var isFullWidth: Bool = false
     public var quotaSubtitle: String = ""
+    /// 卡片第三行附加信息（API Key 卡片用：模型 + 今日 token）
+    public var extraLine: String = ""
+    /// 卡片第四行（API Key 卡片用：p95 延迟 / 错误率 / 花费）
+    public var extraLine2: String = ""
+    /// 额度条下方的口径说明（如"估算 · 本机记账 213 次 / 1200"）—— 估出来的数必须标明
+    public var quotaNote: String = ""
+    /// 一个套餐带多个模型各自额度（如 OpenCode Zen）：卡内只显示用得最紧的 3 个，其余折叠
+    public var subQuotas: [SubQuota] = []
+
+    public var platformDetail: PlatformDetail = PlatformDetail()
+    /// Provider metadata from the same profile/capture as this quota. Unknown stays nil.
+    public var account: AccountIdentity? = nil
+    public var secondaryAccount: AccountIdentity? = nil
+
+    public var hasQuota: Bool { fiveHour != nil || sevenDay != nil || secondaryFiveHour != nil || secondarySevenDay != nil }
+}
+
+/// 一个 API Key（只存代理写下的 SHA-256 前 8 位指纹，永不落明文）今日的用量
+public struct APIKeyUsage: Identifiable {
+    public var id: String { fingerprint }
+    public let fingerprint: String
+    public var calls: Int = 0
+    public var errors: Int = 0
+    public var ctx: Int64 = 0
+    public var out: Int64 = 0
+    public var lastTS: TimeInterval = 0
+    /// 按币种分桶（国产 ¥ / 外国 $）；空 = 没价
+    public var cost: [String: Double] = [:]
+    public var models: [String] = []
+}
+
+/// 经记账代理的某个上游：今日调用汇总 + 额度/余额
+public struct APIProviderStatus: Identifiable {
+    public var id: String { host }
+    public let host: String
+    public let provider: String
+    public var calls: Int = 0
+    public var errors: Int = 0
+    public var ctx: Int64 = 0
+    public var cacheRead: Int64 = 0
+    public var out: Int64 = 0
+    public var think: Int64 = 0
+    public var lastTS: TimeInterval = 0
+    public var models: [String] = []
+    public var plan: String = ""
+    public var fiveHour: QuotaWindow? = nil
+    public var sevenDay: QuotaWindow? = nil
+    public var monthly: QuotaWindow? = nil
+    /// 从最近一次调用的限流响应头解析出来的余量（被动，不额外发请求）
+    public var headerWindow: QuotaWindow? = nil
+    public var headerLabel: String = ""
+    /// 额度是「本机记账的请求数 ÷ 套餐上限」估的（订阅制 Coding Plan 没有公开用量接口）
+    public var quotaIsEstimate: Bool = false
+    /// 估算的底数，要显示给用户看清这数怎么来的："本机记账 213 次 / 1200"
+    public var estimateNote: String = ""
+    public var planLimitText: String = ""
+    public var balanceText: String = ""
+    public var quotaError: String = ""
+    public var cacheHitRate: Double { ctx > 0 ? Double(cacheRead) / Double(ctx) * 100.0 : 0.0 }
+
+    // 可观测性（全部由 api-calls.jsonl 里已有的 status/ms/key 字段算出）
+    public var p50ms: Int = 0
+    public var p95ms: Int = 0
+    public var maxms: Int = 0
+    public var count429: Int = 0
+    /// 按币种分桶（国产 ¥ / 外国 $）；空 = 没配价目表或模型没价，不估（不编价格）
+    public var cost: [String: Double] = [:]
+    public var keys: [APIKeyUsage] = []
+    public var errorRate: Double { calls > 0 ? Double(errors) / Double(calls) * 100.0 : 0.0 }
+}
+
+/// 记账覆盖体检：shell 配置里的 *_BASE_URL 有几处走了代理、几处没走。
+/// 没走的那些 = 面板上看不到的调用（账上的窟窿）。只取变量名与主机名，绝不碰同一行里的 key。
+public struct ProxyCoverage {
+    public struct Entry: Identifiable {
+        public var id: String { "\(file):\(line):\(name)" }
+        public let name: String        // 变量名，如 ANTHROPIC_BASE_URL
+        public let host: String        // 上游主机
+        public let file: String        // 哪个 rc 文件
+        public let line: Int
+        public let proxied: Bool
+    }
+    public var entries: [Entry] = []
+    public var proxiedCount: Int { entries.filter { $0.proxied }.count }
+    public var directCount: Int { entries.filter { !$0.proxied }.count }
+}
+
+public struct ProxyStatus {
+    public var installed: Bool = false
+    public var coverage: ProxyCoverage = ProxyCoverage()
+    /// 价目表状态（没配就别在界面上编花费）
+    public var hasPriceTable: Bool = false
+    public var priceAsOf: String = ""
+
+    public var running: Bool = false
+    public var port: Int = 18790
+    public var callsSinceStart: Int = 0
+    public var providers: [APIProviderStatus] = []
+}
+
+/// 一块占盘的目录。`purgeable` = 允许按年龄清理（只有会话日志与包缓存属于这类）；
+/// 其余（sqlite 运行库、插件、技能、生成的图片）一律只报不动 —— 删了会弄坏工具或丢掉用户资产。
+public struct DiskItem: Identifiable {
+    public var id: String { path }
+    public let path: String
+    public let label: String
+    public var totalMB: Double = 0
+    public var files: Int = 0
+    public var oldMB: Double = 0          // 超过保留天数的部分
+    public var oldFiles: Int = 0
+    public var purgeable: Bool = false
+    public var note: String = ""          // 清了会失去什么 / 为什么不清
+}
+
+public struct RemoteDeviceStatus {
+    public var lastSuccess: TimeInterval? = nil
+    public var lastAttempt: TimeInterval? = nil
+    public var error: String = ""
 }
 
 public struct ScanReport {
+    /// Completion timestamp for this immutable collection snapshot (0 = not collected yet).
+    public var capturedAt: TimeInterval = 0
+
     // 内存与虚拟内存
     public var freePercentage: Int = 0
     public var totalMemoryGB: Double = 0.0
     public var usedMemoryGB: Double = 0.0
     public var swapUsedGB: Double = 0.0
     public var compressorGB: Double = 0.0
-    
+
     // 硬件与发热负载
     public var thermalStateString: String = "正常"
     public var loadAvg1m: Double = 0.0
@@ -101,48 +364,347 @@ public struct ScanReport {
     public var diskFreeGB: Double = 0.0
     public var diskTotalGB: Double = 0.0
     public var diskFreePct: Double = 0.0
-    
-    // 全景主流大模型检测 (Claude / Gemini / OpenAI / Ollama / Cursor 等)
+
+    // 各平台运行时 + 档位 + 额度
     public var detectedLLMs: [DetectedLLMRuntime] = []
-    
-    // Vibe Coding 专属环境状态
-    public var activeClaudeCount: Int = 0
-    public var activeCodexCount: Int = 0
-    public var activeAgyCount: Int = 0
-    public var activeGrokCount: Int = 0
+    public var codexProcesses: [CodexProcessInfo] = []
+    /// Successful inventories, including a proven empty list. Missing device != zero.
+    public var codexProcessDevices: [String] = []
+    public var codexProcessErrors: [String: String] = [:]
+    /// Current login facts, deliberately separate from quota/session account provenance.
+    public var accountPresence: [AccountPresence] = []
+
+    /// 已配置的远程设备（空 = 没有远程），面板顶部「设备」切换器据此显示。
+    public var remoteHosts: [String] = []
+    public var remoteLLMs: [String: [DetectedLLMRuntime]] = [:]
+    public var remoteDeviceStatus: [String: RemoteDeviceStatus] = [:]
+
     public var activeMCPProcessCount: Int = 0
     public var activeMCPTotalMemMB: Double = 0.0
-    
-    // Token 与 Prompt Cache 实时与累计遥测
+
     public var tokens: TokenStats = TokenStats()
-    
-    // 程序员开发缓存
     public var npxCacheMB: Double = 0.0
-    
-    // 断链孤儿垃圾
+    public var npxCacheKnown: Bool = false
+    public var npxCachePending: Bool = false
+
+    // 磁盘占用（会话日志治理）
+    public var disk: [DiskItem] = []
+    public var diskTotalAIGB: Double = 0.0
+    public var diskStatsKnown: Bool = false
+    public var diskStatsPending: Bool = false
+    public var purgeableMB: Double { disk.filter { $0.purgeable }.reduce(0) { $0 + $1.oldMB } }
+
+    // 各 CLI 今日自己的用量
+    public var cliUsage: [CLIUsage] = []
+
+    // API Key 调用（记账代理）
+    public var api: ProxyStatus = ProxyStatus()
+
+    // 断链孤儿
     public var orphanedGroups: [ServiceGroup] = []
+    public var orphans: [OrphanProc] = []
+    public var protected: [ProtectedProc] = []
     public var allOrphanPids: [Int] = []
     public var totalOrphanCount: Int = 0
     public var totalOrphanMemMB: Double = 0.0
 }
 
-public class ProcessScanner {
+// MARK: - 压力信号（菜单栏图标 + 阈值通知共用，纯计算可自测）
+
+/// 一条统一方向的"压力"信号：pct 越大越紧张。
+/// 额度本来就是"已用 %"；内存/磁盘取"已用 %"后与额度同向，可放在一起比。
+public struct PressureSignal: Identifiable, Equatable {
+    public enum Kind: Equatable { case quota, memory, disk }
+
+    /// 去重键：通知状态按它记。额度键里带重置点，换窗口后自然是新键，能再报一次
+    public let key: String
+    public let short: String        // 短名，进图标旁的文字与通知标题
+    public let pct: Int
+    public let detail: String       // 通知正文
+    public let kind: Kind
+
+    public var id: String { key }
+
+    /// 各信号自己的报警线：内存 85% 已用才算紧，磁盘要到 90%，额度 80% 就该收手
+    public var warn: Int {
+        switch kind {
+        case .quota: return 80
+        case .memory: return 85
+        case .disk: return 90
+        }
+    }
+    public var crit: Int {
+        switch kind {
+        case .quota: return 95
+        case .memory: return 93
+        case .disk: return 96
+        }
+    }
+    /// 0 = 正常，1 = 警告，2 = 危急
+    public var level: Int { pct >= crit ? 2 : (pct >= warn ? 1 : 0) }
+    /// 离自己报警线还差多少（正数 = 已越线）。排序按它，而不是按 pct，
+    /// 否则"内存已用 60%"会永远压住"额度已用 55%"，而后者其实更该被看见
+    public var margin: Int { pct - warn }
+}
+
+public extension ScanReport {
+    /// 全部压力信号，按"离各自报警线的距离"倒序。没数据的额度窗口不参与（不编）
+    var pressures: [PressureSignal] {
+        var out: [PressureSignal] = []
+
+        func addQuota(_ w: QuotaWindow?, _ platform: String, _ pool: String) {
+            guard let w = w else { return }
+            let pct = w.effectivePct()
+            var detail = "已用 \(pct)%"
+            if let c = Fmt.countdown(to: w.resetsAt) { detail += " · 重置 \(c)" }
+            let stamp = w.resetsAt.map { String(Int($0)) } ?? "na"
+            out.append(PressureSignal(key: "quota:\(platform):\(pool)@\(stamp)",
+                                      short: "\(platform) \(pool)", pct: pct, detail: detail, kind: .quota))
+        }
+
+        for l in detectedLLMs {
+            addQuota(l.fiveHour, l.name, "5h")
+            addQuota(l.sevenDay, l.name, "周")
+            let sec = l.secondaryPoolName.isEmpty ? "副池" : l.secondaryPoolName
+            addQuota(l.secondaryFiveHour, l.name, "\(sec) 5h")
+            addQuota(l.secondarySevenDay, l.name, "\(sec) 周")
+            for s in l.subQuotas { addQuota(s.window, l.name, s.name) }
+        }
+        for p in api.providers {
+            addQuota(p.fiveHour, p.provider, "5h")
+            addQuota(p.sevenDay, p.provider, "周")
+        }
+
+        if totalMemoryGB > 0 {
+            out.append(PressureSignal(key: "mem", short: "内存", pct: max(0, 100 - freePercentage),
+                                      detail: String(format: "已用 %.1f / %.1f GB · swap %.2f GB",
+                                                     usedMemoryGB, totalMemoryGB, swapUsedGB), kind: .memory))
+        }
+        if diskTotalGB > 0 {
+            out.append(PressureSignal(key: "disk", short: "磁盘", pct: Int((100.0 - diskFreePct).rounded()),
+                                      detail: String(format: "剩余 %.0f GB / %.0f GB", diskFreeGB, diskTotalGB), kind: .disk))
+        }
+
+        return out.sorted { $0.margin != $1.margin ? $0.margin > $1.margin : $0.pct > $1.pct }
+    }
+
+    /// 最紧的那一条 —— 菜单栏图标画它
+    var tightest: PressureSignal? { pressures.first }
+}
+
+// MARK: - 纯展示格式化（可自测）
+
+public enum Fmt {
+    /// "claude-fable-5-1" → "Fable 5.1"；"claude-sonnet-4-5-20250929" → "Sonnet 4.5"；"claude-3-7-sonnet-20250219" → "Sonnet 3.7"
+    public static func modelDisplayName(_ raw: String) -> String {
+        if raw.isEmpty { return "AI" }
+        var s = raw.lowercased()
+        for prefix in ["anthropic/", "models/", "claude-"] where s.hasPrefix(prefix) {
+            s.removeFirst(prefix.count)
+        }
+        var parts = s.split(separator: "-").map(String.init)
+        if let last = parts.last, last.count == 8, Int(last) != nil { parts.removeLast() } // 日期后缀
+        let words = parts.filter { Int($0) == nil }.map { $0.prefix(1).uppercased() + $0.dropFirst() }
+        let nums = parts.filter { Int($0) != nil }
+        let out = [words.joined(separator: " "), nums.joined(separator: ".")].filter { !$0.isEmpty }.joined(separator: " ")
+        return out.isEmpty ? raw : out
+    }
+
+    private static let isoFrac: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    private static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
+    /// ISO8601 → epoch。ISO8601DateFormatter 只认 3 位小数秒，grok 写 6 位 → 先截到 3 位
+    public static func parseISODate(_ raw: String?) -> TimeInterval? {
+        guard var s = raw else { return nil }
+        if let r = s.range(of: #"\.\d{4,}"#, options: .regularExpression) {
+            s.replaceSubrange(r, with: s[r].prefix(4))
+        }
+        return (isoFrac.date(from: s) ?? isoPlain.date(from: s))?.timeIntervalSince1970
+    }
+
+    /// 距重置点倒计时："35m" / "1h49m" / "2d10h"；已过 → "已重置"；无数据 → nil
+    public static func countdown(to resetsAt: TimeInterval?, now: TimeInterval = Date().timeIntervalSince1970) -> String? {
+        guard let r = resetsAt else { return nil }
+        let secs = Int(r - now)
+        if secs <= 0 { return "已重置" }
+        let m = secs / 60
+        if m < 60 { return "\(m)m" }
+        let h = m / 60
+        if h < 24 { return "\(h)h\(m % 60)m" }
+        return "\(h / 24)d\(h % 24)h"
+    }
+
+    private static let dateFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
+    public static func dateText(_ t: TimeInterval) -> String {
+        dateFmt.string(from: Date(timeIntervalSince1970: t))
+    }
+
+    /// 紧凑相对时间（卡片脚注用）："刚刚" / "12m前" / "16h前" / "3d前"
+    public static func agoShort(_ secs: Int) -> String {
+        if secs < 60 { return "刚刚" }
+        if secs < 3600 { return "\(secs / 60)m前" }
+        if secs < 86400 { return "\(secs / 3600)h前" }
+        return "\(secs / 86400)d前"
+    }
+
+    private static let usageResetFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MMM d, yyyy h:mm a"
+        return f
+    }()
+
+    /// Codex 额度耗尽文案里的重置时间："...try again at Sep 19th, 2026 5:03 PM." → epoch（按本机时区）
+    public static func parseUsageLimitReset(_ message: String) -> TimeInterval? {
+        guard let re = try? NSRegularExpression(pattern: #"try again (?:at|on)\s+([A-Za-z]{3,})\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})[,\s]+(\d{1,2}):(\d{2})\s*([AaPp])\.?[Mm]"#) else { return nil }
+        let ns = message as NSString
+        guard let m = re.firstMatch(in: message, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        func g(_ i: Int) -> String { ns.substring(with: m.range(at: i)) }
+        let month = String(g(1).prefix(3))
+        let text = "\(month) \(g(2)), \(g(3)) \(g(4)):\(g(5)) \(g(6).uppercased())M"
+        usageResetFormatter.timeZone = TimeZone.current
+        return usageResetFormatter.date(from: text)?.timeIntervalSince1970
+    }
+
+    /// 最近秩百分位（样本少的时候比插值直观：p95 一定是某次真实调用的耗时）
+    public static func percentile(_ values: [Int], _ p: Double) -> Int {
+        guard !values.isEmpty else { return 0 }
+        let s = values.sorted()
+        let idx = Int((p * Double(s.count)).rounded(.up)) - 1
+        return s[max(0, min(s.count - 1, idx))]
+    }
+
+    /// 毫秒 → "312ms" / "4.3s" / "1m02s"
+    public static func ms(_ v: Int) -> String {
+        if v <= 0 { return "—" }
+        if v < 1000 { return "\(v)ms" }
+        if v < 60_000 { return String(format: "%.1fs", Double(v) / 1000.0) }
+        return String(format: "%dm%02ds", v / 60_000, (v % 60_000) / 1000)
+    }
+
+    /// 相对时间："刚刚" / "35秒前" / "12分钟前" / "3小时前"
+    public static func ago(_ secs: Int) -> String {
+        if secs < 8 { return "刚刚" }
+        if secs < 60 { return "\(secs)秒前" }
+        if secs < 3600 { return "\(secs / 60)分钟前" }
+        return "\(secs / 3600)小时前"
+    }
+}
+
+// MARK: - 扫描器
+
+public final class ProcessScanner {
     public static let shared = ProcessScanner()
-    
-    private var lastCumulativeScanTime: TimeInterval = 0
-    private var cachedTokenStats = TokenStats()
-    
+
+    private let lock = NSRecursiveLock()
+    private let resourceStateLock = NSLock()
+    private let resourceQueue = DispatchQueue(label: "io.github.xixilys.vibedeck.resource-scan", qos: .utility)
+    private let log = Logger(subsystem: "io.github.xixilys.vibedeck", category: "scan")
+    private let home: String
+    private let env = ProcessInfo.processInfo.environment
+    private let npxMeasurementOverride: (() -> Double?)?
+    private let diskMeasurementOverride: (() -> (items: [DiskItem], totalGB: Double)?)?
+
+    // 缓存：JSON 文件按 mtime 缓存（~/.claude.json 有 200KB+，每秒解析太浪费）
+    private var jsonCache: [String: (mtime: TimeInterval, json: [String: Any])] = [:]
+    // 缓存：会话 jsonl 增量解析状态
+    private struct FileParseState {
+        var mtime: TimeInterval = 0
+        var size: UInt64 = 0
+        var parsedOffset: UInt64 = 0
+        var head = Data()          // 文件前 256 字节指纹，识别原地重写 / 替换
+        var turns: [String: InteractionRecord] = [:]
+    }
+    private var fileStates: [String: FileParseState] = [:]
+    /// 会话文件 → 工作目录。文件里写的 cwd 是权威值；目录名那种把 / 换成 - 的编码解不回来
+    /// （`vibedeck` 会被拆成 vibe/gauge），所以一律读文件。读到就缓存，不重复读盘。
+    private var fileCwdCache: [String: String] = [:]
+
+    private func sessionCwd(of path: String) -> String? {
+        if let c = fileCwdCache[path] { return c.isEmpty ? nil : c }
+        guard let fh = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? fh.close() }
+        let head = String(decoding: (try? fh.read(upToCount: 16384)) ?? Data(), as: UTF8.self)
+        var found = ""
+        for line in head.split(separator: "\n").prefix(12) {
+            guard let data = line.data(using: .utf8),
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if let c = j["cwd"] as? String, !c.isEmpty { found = c; break }
+            if let p = j["payload"] as? [String: Any], let c = p["cwd"] as? String, !c.isEmpty { found = c; break }
+        }
+        fileCwdCache[path] = found
+        return found.isEmpty ? nil : found
+    }
+    // Expensive storage scans run outside `lock`; this lock protects only snapshots and state.
+    private var npxCache: (mb: Double, at: TimeInterval)? = nil
+    private var npxScanPending = false
+    private var npxScanGeneration = 0
+    private var npxLastAttemptAt: TimeInterval = 0
+    private var npxCleanupPending = false
+    private var diskCache: (at: TimeInterval, items: [DiskItem], totalGB: Double)? = nil
+    private var diskScanPending = false
+    private var diskScanGeneration = 0
+    private var diskLastAttemptAt: TimeInterval = 0
+    private var ollamaCache: (count: Int, sub: String, at: TimeInterval)? = nil
+
+    init(home: String = FileManager.default.homeDirectoryForCurrentUser.path,
+         npxMeasurement: (() -> Double?)? = nil,
+         diskMeasurement: (() -> (items: [DiskItem], totalGB: Double)?)? = nil) {
+        self.home = home
+        self.npxMeasurementOverride = npxMeasurement
+        self.diskMeasurementOverride = diskMeasurement
+    }
+
+    /// 由 launchd 托管的常驻服务：ppid 天然是 1，但它们是「该活着的」，绝不能当孤儿杀。
+    /// 从 plist 的 Program / ProgramArguments 里取出非解释器的实参当特征（取解释器路径会保护掉所有 python/node，太宽）。
+    private var launchdCache: (at: TimeInterval, tokens: [(token: String, label: String)])? = nil
+    private let interpreters: Set<String> = ["python", "python3", "node", "bun", "deno", "ruby", "perl", "sh", "bash", "zsh", "env", "uvx", "npx", "uv", "npm", "pnpm", "yarn", "open", "osascript"]
+
+    private func launchdProtectedTokens() -> [(token: String, label: String)] {
+        let now = Date().timeIntervalSince1970
+        if let c = launchdCache, now - c.at < 300 { return c.tokens }
+        var out: [(String, String)] = []
+        let fm = FileManager.default
+        let dirs = ["\(home)/Library/LaunchAgents", "/Library/LaunchAgents", "/Library/LaunchDaemons"]
+        for dir in dirs {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for n in names where n.hasSuffix(".plist") {
+                guard let data = try? Data(contentsOf: URL(fileURLWithPath: "\(dir)/\(n)")),
+                      let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else { continue }
+                let label = plist["Label"] as? String ?? n
+                var args: [String] = []
+                if let prog = plist["Program"] as? String { args.append(prog) }
+                if let pa = plist["ProgramArguments"] as? [String] { args.append(contentsOf: pa) }
+                for a in args {
+                    let base = String(a.split(separator: "/").last ?? "")
+                    if a.hasPrefix("-") || base.isEmpty || interpreters.contains(base) { continue }
+                    if a.count < 6 { continue }              // 太短的实参当特征会误伤
+                    out.append((a, label))
+                }
+            }
+        }
+        launchdCache = (now, out)
+        return out
+    }
+
     private let whitelist = [
-        "CleanMyMac",
-        "figma-agent-bridge",
-        "tailscale",
-        "docker",
-        "com.docker",
-        "/System",
-        "/usr/libexec",
-        "/usr/sbin"
+        "CleanMyMac", "figma-agent-bridge", "tailscale", "docker", "com.docker",
+        "/System", "/usr/libexec", "/usr/sbin"
     ]
-    
+
     private let serviceDefinitions: [(key: String, name: String)] = [
         ("apple-docs", "Apple Docs 接口服务"),
         ("chrome-devtools", "Chrome DevTools 自动化插件"),
@@ -153,939 +715,2583 @@ public class ProcessScanner {
         ("meigen", "Meigen 图像服务"),
         ("context7", "Context7 检索服务")
     ]
-    
-    // MARK: - 实时会话判定探针 (精准区分用户 CLI 交互终端 vs 子脚本/MCP/插件)
+
+    // MARK: 会话判定（用户交互终端 vs 子脚本/MCP）
+
+    private static func isShellWrapper(_ cmd: String) -> Bool {
+        cmd.hasPrefix("/bin/zsh") || cmd.hasPrefix("/bin/bash") || cmd.hasPrefix("zsh") || cmd.hasPrefix("bash") || cmd.hasPrefix("sh ")
+    }
+
+    private static func binName(_ cmd: String) -> String {
+        String(executablePath(cmd).split(separator: "/").last ?? "")
+    }
+
+    /// 命令行的第一个 token = 可执行文件路径。
+    /// 探测必须只看这个，不能在整条命令行里找子串：任何 shell 命令（包括别人 grep 这些名字）都会命中，造成误判。
+    private static func executablePath(_ cmd: String) -> String {
+        String(cmd.split(separator: " ").first ?? "")
+    }
+
+    /// 某个 App/CLI 是否真的在跑：看可执行文件路径，且跳过 shell 包装器
+    private static func isRunning(_ cmd: String, bundle: String, bins: [String]) -> Bool {
+        let t = cmd.trimmingCharacters(in: .whitespaces)
+        if isShellWrapper(t) { return false }
+        let exe = executablePath(t).lowercased()
+        if !bundle.isEmpty, exe.contains(bundle) { return true }
+        let bin = String(exe.split(separator: "/").last ?? "")
+        return bins.contains(bin)
+    }
+
     public static func isClaudeCLISession(cmd: String) -> Bool {
-        let trimmed = cmd.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("/bin/zsh") || trimmed.hasPrefix("/bin/bash") || trimmed.hasPrefix("zsh") || trimmed.hasPrefix("bash") || trimmed.hasPrefix("sh ") { return false }
-        if trimmed.contains("mcp-server") || trimmed.contains("grep") { return false }
-        let parts = trimmed.split(separator: " ")
-        guard let first = parts.first else { return false }
-        let bin = String(first.split(separator: "/").last ?? "")
-        return bin == "claude"
+        let t = cmd.trimmingCharacters(in: .whitespaces)
+        if isShellWrapper(t) || t.contains("mcp-server") || t.contains("grep") { return false }
+        return binName(t) == "claude"
     }
 
     public static func isCodexCLISession(cmd: String) -> Bool {
-        let trimmed = cmd.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("/bin/zsh") || trimmed.hasPrefix("/bin/bash") || trimmed.hasPrefix("zsh") || trimmed.hasPrefix("bash") || trimmed.hasPrefix("sh ") { return false }
-        if trimmed.contains("mcp-server") || trimmed.contains("ChatGPT for Chrome") || trimmed.contains("chrome-extension") || trimmed.contains("ssh") || trimmed.contains("grep") { return false }
-        let parts = trimmed.split(separator: " ")
-        guard let first = parts.first else { return false }
-        let bin = String(first.split(separator: "/").last ?? "")
-        if bin == "codex" || bin == "codex.js" {
-            return true
-        }
-        if bin.contains("node") && parts.count > 1 {
-            let arg1 = String(parts[1])
-            if arg1.contains("codex") && !arg1.contains("mcp-server") {
-                return true
-            }
-        }
-        return false
+        CodexProcessMonitor.role(command: cmd) == .cli
     }
 
     public static func isAgyCLISession(cmd: String) -> Bool {
-        let trimmed = cmd.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("/bin/zsh") || trimmed.hasPrefix("/bin/bash") || trimmed.hasPrefix("zsh") || trimmed.hasPrefix("bash") || trimmed.hasPrefix("sh ") { return false }
-        if trimmed.contains("agy-routed") || trimmed.contains("agy-batch") || trimmed.contains("agy-review") || trimmed.contains("agy-video") || trimmed.contains("grep") { return false }
-        let parts = trimmed.split(separator: " ")
-        guard let first = parts.first else { return false }
-        let bin = String(first.split(separator: "/").last ?? "")
-        return bin == "agy"
+        let t = cmd.trimmingCharacters(in: .whitespaces)
+        if isShellWrapper(t) || t.contains("grep") { return false }
+        for sub in ["agy-routed", "agy-batch", "agy-review", "agy-video"] where t.contains(sub) { return false }
+        return binName(t) == "agy"
     }
 
     public static func isGrokCLISession(cmd: String) -> Bool {
-        let trimmed = cmd.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("/bin/zsh") || trimmed.hasPrefix("/bin/bash") || trimmed.hasPrefix("zsh") || trimmed.hasPrefix("bash") || trimmed.hasPrefix("sh ") { return false }
-        if trimmed.contains("mcp-server") || trimmed.contains("grep") { return false }
-        let parts = trimmed.split(separator: " ")
-        guard let first = parts.first else { return false }
-        let bin = String(first.split(separator: "/").last ?? "")
-        return bin == "grok"
+        let t = cmd.trimmingCharacters(in: .whitespaces)
+        if isShellWrapper(t) || t.contains("mcp-server") || t.contains("grep") { return false }
+        return binName(t) == "grok"
     }
-    
-    private func execute(_ cmd: String) -> String {
+
+    // MARK: 基础工具
+
+    /// Shell helper for read-only probes. Bounded: a probe stuck on a dead network mount (lsof stat()s open files)
+    /// used to block `scan()` forever, and because scans never overlap, every panel number froze and aged into
+    /// "unconfirmed". On timeout the child is terminated and the caller sees `nil`, so it can keep its previous cache.
+    private func execute(_ cmd: String, timeout: TimeInterval = 10) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-c", cmd]
+        process.standardInput = FileHandle.nullDevice
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
+        process.standardError = FileHandle.nullDevice   // an undrained stderr pipe can also block the child
+        let exited = DispatchSemaphore(value: 0), drained = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        do { try process.run() } catch { return nil }
+        let box = ExecuteOutput()
+        DispatchQueue.global(qos: .utility).async {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8) ?? ""
-        } catch {
-            return ""
+            box.lock.lock(); box.data = data; box.lock.unlock()
+            drained.signal()
         }
+        guard exited.wait(timeout: .now() + timeout) == .success else {
+            if process.isRunning { process.terminate() }
+            if exited.wait(timeout: .now() + 0.5) == .timedOut, process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            return nil
+        }
+        guard drained.wait(timeout: .now() + 1) == .success else { return nil }
+        box.lock.lock(); defer { box.lock.unlock() }
+        return String(data: box.data, encoding: .utf8) ?? ""
     }
-    
-    public func scan() -> ScanReport {
-        var report = ScanReport()
-        
-        // 1. memory_pressure
-        let mp = execute("memory_pressure")
-        for line in mp.components(separatedBy: "\n") {
-            if line.contains("System-wide memory free percentage:") {
-                let parts = line.components(separatedBy: ":")
-                if parts.count > 1 {
-                    let s = parts[1].replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespaces)
-                    report.freePercentage = Int(s) ?? 0
+
+    private final class ExecuteOutput: @unchecked Sendable {
+        let lock = NSLock()
+        var data = Data()
+    }
+
+    /// 按 mtime 缓存的 JSON 读取
+    private func readJSON(_ path: String) -> [String: Any]? {
+        guard let probe = vgFileStat(path) else {
+            jsonCache[path] = nil
+            return nil
+        }
+        let mtime = probe.mtime
+        if let c = jsonCache[path], c.mtime == mtime { return c.json }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        jsonCache[path] = (mtime, json)
+        return json
+    }
+
+    /// 读文件尾部 maxBytes（整行对齐由调用方处理）
+    private func readTail(_ path: String, maxBytes: Int) -> String {
+        guard let fh = FileHandle(forReadingAtPath: path) else { return "" }
+        defer { try? fh.close() }
+        let size = (try? fh.seekToEnd()) ?? 0
+        let start = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+        try? fh.seek(toOffset: start)
+        let data = fh.readDataToEndOfFile()
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func parseISO(_ s: String?) -> TimeInterval? { Fmt.parseISODate(s) }
+
+    private func clampPct(_ n: NSNumber?) -> Int? {
+        guard let n = n else { return nil }
+        return max(0, min(100, Int(round(n.doubleValue))))
+    }
+
+    private static let physicalMemoryGB = Double(ProcessInfo.processInfo.physicalMemory) / pow(1024, 3)
+
+    /// memory_pressure 的 free% 是 memorystatus_get_level，而不是 free/inactive 页的简单和。
+    /// kern.memorystatus_level 与该 syscall 读取同一个内核变量；VM 页统计只用于 compressor。
+    func memorySnapshot() -> (freePercentage: Int, compressorGB: Double, swapUsedGB: Double) {
+        var level: Int32 = 0
+        var size = MemoryLayout.size(ofValue: level)
+        let levelOK = sysctlbyname("kern.memorystatus_level", &level, &size, nil, 0) == 0
+        var stats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
+        let host = mach_host_self()
+        defer { mach_port_deallocate(mach_task_self_, host) }
+        let status = withUnsafeMutablePointer(to: &stats) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(host, HOST_VM_INFO64, $0, &count)
+            }
+        }
+        var compressor = Double(stats.compressor_page_count) * Double(vm_page_size) / pow(1024, 3)
+        // 保留旧系统/接口失败时的读数，不用近似公式改变告警阈值。
+        if !levelOK || status != KERN_SUCCESS {
+            for line in (execute("memory_pressure", timeout: 5) ?? "").components(separatedBy: "\n") {
+                let value = line.split(separator: ":").last?.trimmingCharacters(in: .whitespaces)
+                if !levelOK, line.contains("System-wide memory free percentage:"), let value {
+                    level = Int32(value.replacingOccurrences(of: "%", with: "")) ?? 0
                 }
-            } else if line.contains("Pages used by compressor:") {
-                let parts = line.components(separatedBy: ":")
-                if parts.count > 1 {
-                    let pages = Double(parts[1].trimmingCharacters(in: .whitespaces)) ?? 0.0
-                    report.compressorGB = (pages * 16384.0) / (1024.0 * 1024.0)
+                if status != KERN_SUCCESS, line.contains("Pages used by compressor:"), let value {
+                    compressor = (Double(value) ?? 0) * Double(vm_page_size) / pow(1024, 3)
                 }
             }
         }
-        
-        // 2. Total Memory
-        let memStr = execute("sysctl -n hw.memsize").trimmingCharacters(in: .whitespacesAndNewlines)
-        if let bytes = Double(memStr) {
-            report.totalMemoryGB = bytes / (1024.0 * 1024.0 * 1024.0)
-            report.usedMemoryGB = report.totalMemoryGB * (1.0 - Double(report.freePercentage) / 100.0)
+        var swap = xsw_usage()
+        size = MemoryLayout.size(ofValue: swap)
+        let swapOK = sysctlbyname("vm.swapusage", &swap, &size, nil, 0) == 0
+        return (Int(level), compressor, swapOK ? Double(swap.xsu_used) / pow(1024, 3) : 0)
+    }
+
+    private var listeningCache: (at: TimeInterval, pids: Set<Int>)?
+    private func listeningProcesses() -> Set<Int> {
+        let now = ProcessInfo.processInfo.systemUptime
+        if let cache = listeningCache, now - cache.at < 60 { return cache.pids }
+        // -b/-w: don't block on kernel calls for unreachable mounts; on timeout keep the previous answer.
+        guard let output = execute("/usr/sbin/lsof -b -w -iTCP -sTCP:LISTEN -n -P", timeout: 8) else {
+            listeningCache = (now, listeningCache?.pids ?? [])
+            return listeningCache?.pids ?? []
         }
-        
-        // 3. Swap usage
-        let swapStr = execute("sysctl vm.swapusage")
-        if let regex = try? NSRegularExpression(pattern: "used\\s*=\\s*([0-9\\.]+)M") {
-            let ns = swapStr as NSString
-            if let match = regex.firstMatch(in: swapStr, range: NSRange(location: 0, length: ns.length)) {
-                let valStr = ns.substring(with: match.range(at: 1))
-                let mb = Double(valStr) ?? 0.0
-                report.swapUsedGB = mb / 1024.0
+        var pids = Set<Int>()
+        for line in output.components(separatedBy: "\n").dropFirst() {
+            let cols = line.split(whereSeparator: { $0.isWhitespace })
+            if cols.count >= 2, let pid = Int(cols[1]) { pids.insert(pid) }
+        }
+        listeningCache = (now, pids)
+        return pids
+    }
+
+    // MARK: 进程表
+
+    private struct RawProc {
+        let pid: Int
+        let ppid: Int
+        let memMB: Double
+        let cmd: String
+    }
+
+    /// 一批 pid 的 cwd（一次 lsof 拿完）
+    private func cwds(of pids: [Int]) -> [Int: String] {
+        guard !pids.isEmpty else { return [:] }
+        let out = execute("/usr/sbin/lsof -b -w -p \(pids.map(String.init).joined(separator: ",")) -a -d cwd -Fpn 2>/dev/null", timeout: 8) ?? ""
+        var map: [Int: String] = [:]
+        var cur = 0
+        for line in out.components(separatedBy: "\n") {
+            if line.hasPrefix("p") { cur = Int(line.dropFirst()) ?? 0 }
+            else if line.hasPrefix("n"), cur != 0 { map[cur] = String(line.dropFirst()) }
+        }
+        return map
+    }
+
+    /// 进程已运行秒数（ps etime）
+    private func ages(of pids: [Int]) -> [Int: Int] {
+        guard !pids.isEmpty else { return [:] }
+        let out = execute("ps -o pid=,etime= -p \(pids.map(String.init).joined(separator: ","))") ?? ""
+        var map: [Int: Int] = [:]
+        for line in out.components(separatedBy: "\n") {
+            let f = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard f.count >= 2, let pid = Int(f[0]) else { continue }
+            // etime: [[dd-]hh:]mm:ss
+            var secs = 0
+            let main = f[1].split(separator: "-")
+            if main.count == 2 { secs += (Int(main[0]) ?? 0) * 86400 }
+            let parts = (main.last ?? "").split(separator: ":").map { Int($0) ?? 0 }
+            if parts.count == 3 { secs += parts[0] * 3600 + parts[1] * 60 + parts[2] }
+            else if parts.count == 2 { secs += parts[0] * 60 + parts[1] }
+            map[pid] = secs
+        }
+        return map
+    }
+
+    private lazy var codexProcessMonitor = CodexProcessMonitor(home: home)
+    private lazy var accountPresenceCollector = AccountPresenceCollector(home: home, environment: env)
+
+    private struct SessionCounts {
+        var codexProcesses: [CodexProcessInfo] = []
+        var claude = 0, codex = 0, agy = 0, grok = 0
+        var ollama = false, cursor = false, lmStudio = false
+        var pids: [CLIKind: [Int]] = [:]
+        var mem: [Int: Double] = [:]
+    }
+
+    private var processReadSucceeded = false
+    private func readProcs() -> [Int: RawProc] {
+        var procs: [Int: RawProc] = [:]
+        let out = execute("ps -axo pid,ppid,rss,command") ?? ""
+        processReadSucceeded = !out.isEmpty
+        for line in out.components(separatedBy: "\n").dropFirst() {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty { continue }
+            let parts = t.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
+            guard parts.count >= 4,
+                  let pid = Int(parts[0]), let ppid = Int(parts[1]), let rssKB = Double(parts[2]) else { continue }
+            procs[pid] = RawProc(pid: pid, ppid: ppid, memMB: rssKB / 1024.0, cmd: String(parts[3]))
+        }
+        return procs
+    }
+
+    private enum CLIKind { case claude, codex, agy, grok }
+
+    private func countSessions(_ procs: [Int: RawProc]) -> SessionCounts {
+        var c = SessionCounts()
+        c.codexProcesses = codexProcessMonitor.snapshot(procs.values.map {
+            CodexProcessSample(pid: $0.pid, parentPID: $0.ppid, command: $0.cmd, memMB: $0.memMB)
+        })
+        c.codex = c.codexProcesses.count
+        c.pids[.codex] = c.codexProcesses.map { $0.pid }
+        for p in c.codexProcesses { c.mem[p.pid] = p.memMB }
+
+        // 第一遍：命中的进程
+        var matched: [Int: CLIKind] = [:]
+        for p in procs.values {
+            if ProcessScanner.isRunning(p.cmd, bundle: "/cursor.app/", bins: ["cursor"]) { c.cursor = true }
+            if ProcessScanner.isRunning(p.cmd, bundle: "/ollama.app/", bins: ["ollama"]) { c.ollama = true }
+            if ProcessScanner.isRunning(p.cmd, bundle: "lm studio.app/", bins: ["lm studio", "lmstudio"]) { c.lmStudio = true }
+            guard p.ppid != 1 else { continue }
+            if ProcessScanner.isClaudeCLISession(cmd: p.cmd) { matched[p.pid] = .claude }
+            else if ProcessScanner.isAgyCLISession(cmd: p.cmd) { matched[p.pid] = .agy }
+            else if ProcessScanner.isGrokCLISession(cmd: p.cmd) { matched[p.pid] = .grok }
+        }
+
+        // 第二遍：一个会话 = 一棵进程树的根。CLI 会派生同名子进程（node 包装器 → 原生二进制 → 插件宿主），
+        // 祖先已命中的就不再单独算一个会话，否则一个 Codex 会话会被数成 3 个。
+        for (pid, kind) in matched {
+            var cur = procs[pid]?.ppid ?? 1
+            var hops = 0
+            var nested = false
+            while cur > 1, hops < 30 {
+                if matched[cur] != nil { nested = true; break }
+                cur = procs[cur]?.ppid ?? 1
+                hops += 1
+            }
+            if nested { continue }
+            c.pids[kind, default: []].append(pid)
+            c.mem[pid] = procs[pid]?.memMB ?? 0
+            switch kind {
+            case .claude: c.claude += 1
+            case .codex: c.codex += 1
+            case .agy: c.agy += 1
+            case .grok: c.grok += 1
             }
         }
-        
-        // 4. 硬件发热状态与 CPU 负载
-        let thermal = ProcessInfo.processInfo.thermalState
-        switch thermal {
+        // Grok 双保险：~/.grok/active_sessions.json 里存活的 pid
+        if c.grok == 0,
+           let data = try? Data(contentsOf: URL(fileURLWithPath: "\(home)/.grok/active_sessions.json")),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            c.grok = json.filter { ($0["pid"] as? Int).map { kill(pid_t($0), 0) == 0 } ?? false }.count
+        }
+        return c
+    }
+
+    // MARK: 快层 8s；面板关闭时慢层 30s，打开时 8s
+
+    private var slowReport: ScanReport?
+    private var lastSlowScanAt: TimeInterval?
+
+    static func slowScanDue(last: TimeInterval?, now: TimeInterval, panelVisible: Bool, force: Bool = false) -> Bool {
+        guard let last, !force else { return true }
+        return now - last >= (panelVisible ? 8 : 30)
+    }
+
+    public func scan(refreshRemote: Bool = true, panelVisible: Bool = false, forceSlow: Bool = false) -> ScanReport {
+        if refreshRemote {
+            RemoteCollector.refreshDiscoveryIfDue()
+            refreshRemoteCodexIfDue()
+            refreshRemoteSummaryIfDue()
+        }  // 自测只扫描本机，不为验收触发远程 SSH；历史用量由 UsageHistory 独立采集。
+        lock.lock(); defer { lock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        if forceSlow { listeningCache = nil }
+        let refreshSlow = Self.slowScanDue(last: lastSlowScanAt, now: now, panelVisible: panelVisible, force: forceSlow)
+        var report = slowReport ?? ScanReport()
+
+        // 1. 内存：直接读 memory_pressure 使用的内核值，避免每 8 秒启动三个命令。
+        let memory = memorySnapshot()
+        report.freePercentage = memory.freePercentage
+        report.compressorGB = memory.compressorGB
+        report.totalMemoryGB = Self.physicalMemoryGB
+        report.usedMemoryGB = report.totalMemoryGB * (1.0 - Double(report.freePercentage) / 100.0)
+        report.swapUsedGB = memory.swapUsedGB
+
+        // 4. 发热与负载
+        switch ProcessInfo.processInfo.thermalState {
         case .nominal: report.thermalStateString = "正常"
         case .fair: report.thermalStateString = "微热"
         case .serious: report.thermalStateString = "较高 (可能降频)"
         case .critical: report.thermalStateString = "严重过热"
         @unknown default: report.thermalStateString = "正常"
         }
-        
         var loadavg = [Double](repeating: 0.0, count: 3)
         getloadavg(&loadavg, 3)
         report.loadAvg1m = loadavg[0]
         report.loadAvg5m = loadavg[1]
-        
-        // 5. 磁盘剩余空间
+
+        // 5. 磁盘
         if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: "/"),
            let freeBytes = attrs[.systemFreeSize] as? Int64,
            let totalBytes = attrs[.systemSize] as? Int64 {
             report.diskFreeGB = Double(freeBytes) / (1024.0 * 1024.0 * 1024.0)
             report.diskTotalGB = Double(totalBytes) / (1024.0 * 1024.0 * 1024.0)
-            if report.diskTotalGB > 0 {
-                report.diskFreePct = (report.diskFreeGB / report.diskTotalGB) * 100.0
+            if report.diskTotalGB > 0 { report.diskFreePct = report.diskFreeGB / report.diskTotalGB * 100.0 }
+        }
+
+        // 6. NPX 缓存（du 走盘慢，5 分钟节流）
+        let npx = npxCacheSnapshot()
+        report.npxCacheMB = npx.value
+        report.npxCacheKnown = npx.known
+        report.npxCachePending = npx.pending
+        let disk = diskStatsSnapshot()
+        report.disk = disk.items
+        report.diskTotalAIGB = disk.totalGB
+        report.diskStatsKnown = disk.known
+        report.diskStatsPending = disk.pending
+
+        if refreshSlow {
+            report.activeMCPProcessCount = 0
+            report.activeMCPTotalMemMB = 0
+            // 7. 仅当确有孤儿候选时查询监听端口；无候选的常见路径不运行 lsof。
+            let procs = readProcs()
+            let counts = countSessions(procs)
+            let allKeywords = serviceDefinitions.map { $0.key } + ["_npx", "mcp"]
+            func isRunner(_ lower: String) -> Bool {
+                lower.contains("node") || lower.contains("npm") || lower.contains("python") || lower.contains("uv")
             }
-        }
-        
-        // 6. NPX 工具缓存大小 (~/.npm/_npx)
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let npxPath = "\(home)/.npm/_npx"
-        if FileManager.default.fileExists(atPath: npxPath) {
-            let duOut = execute("/usr/bin/du -sk '\(npxPath)'")
-            if let first = duOut.components(separatedBy: "\t").first, let kb = Double(first.trimmingCharacters(in: .whitespaces)) {
-                report.npxCacheMB = kb / 1024.0
+            let hasOrphanCandidates = procs.values.contains {
+                let lower = $0.cmd.lowercased()
+                return $0.ppid == 1 && isRunner(lower) && allKeywords.contains(where: { lower.contains($0) })
             }
-        }
-        
-        // 7. Listening ports via lsof
-        let lsofOut = execute("lsof -iTCP -sTCP:LISTEN -n -P")
-        var listeningPids = Set<Int>()
-        for line in lsofOut.components(separatedBy: "\n").dropFirst() {
-            let cols = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-            if cols.count >= 2, let pid = Int(cols[1]) {
-                listeningPids.insert(pid)
-            }
-        }
-        
-        // 8. PS table & AI sessions inspection
-        let psOut = execute("ps -axo pid,ppid,rss,%mem,command")
-        let psLines = psOut.components(separatedBy: "\n").dropFirst()
-        
-        struct RawProc {
-            let pid: Int
-            let ppid: Int
-            let memMB: Double
-            let cmd: String
-        }
-        
-        var allProcs: [Int: RawProc] = [:]
-        let allKeywords = serviceDefinitions.map { $0.key } + ["_npx", "mcp"]
-        var hasCursor = false
-        var hasOllama = false
-        var hasLMStudio = false
-        
-        for line in psLines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty { continue }
-            let parts = trimmed.split(separator: " ", maxSplits: 4, omittingEmptySubsequences: true)
-            if parts.count >= 5 {
-                guard let pid = Int(parts[0]),
-                      let ppid = Int(parts[1]),
-                      let rssKB = Double(parts[2]) else { continue }
-                let cmd = String(parts[4])
-                let memMB = rssKB / 1024.0
-                allProcs[pid] = RawProc(pid: pid, ppid: ppid, memMB: memMB, cmd: cmd)
-                
-                let lowerCmd = cmd.lowercased()
-                
-                // 检查主流模型与工具进程
-                if lowerCmd.contains("cursor.app") || (lowerCmd.contains("/cursor") && !lowerCmd.contains("cursoruiviewservice")) {
-                    hasCursor = true
-                }
-                if lowerCmd.contains("ollama") {
-                    hasOllama = true
-                }
-                if lowerCmd.contains("lmstudio") || lowerCmd.contains("lm studio") {
-                    hasLMStudio = true
-                }
-                
-                // 统计正在活跃的 AI 会话
-                if ppid != 1 {
-                    if ProcessScanner.isClaudeCLISession(cmd: cmd) {
-                        report.activeClaudeCount += 1
-                    } else if ProcessScanner.isCodexCLISession(cmd: cmd) {
-                        report.activeCodexCount += 1
-                    } else if ProcessScanner.isAgyCLISession(cmd: cmd) {
-                        report.activeAgyCount += 1
-                    } else if ProcessScanner.isGrokCLISession(cmd: cmd) {
-                        report.activeGrokCount += 1
-                    } else {
-                        // 统计活跃挂载的 MCP 进程
-                        let isMCP = allKeywords.contains(where: { lowerCmd.contains($0) })
-                        let isRunner = lowerCmd.contains("node") || lowerCmd.contains("npm") || lowerCmd.contains("python") || lowerCmd.contains("uv")
-                        if isMCP && isRunner {
-                            report.activeMCPProcessCount += 1
-                            report.activeMCPTotalMemMB += memMB
-                        }
-                    }
+            let listeningPids = hasOrphanCandidates ? listeningProcesses() : []
+            for p in procs.values where p.ppid != 1 {
+                let lower = p.cmd.lowercased()
+                if ProcessScanner.isClaudeCLISession(cmd: p.cmd) || CodexProcessMonitor.role(command: p.cmd) != nil
+                    || ProcessScanner.isAgyCLISession(cmd: p.cmd) || ProcessScanner.isGrokCLISession(cmd: p.cmd) { continue }
+                if isRunner(lower) && allKeywords.contains(where: { lower.contains($0) }) {
+                    report.activeMCPProcessCount += 1
+                    report.activeMCPTotalMemMB += p.memMB
                 }
             }
-        }
-        
-        // 探活 Grok 活跃会话 (~/.grok/active_sessions.json 双重保障)
-        if report.activeGrokCount == 0 {
-            let grokSessionsPath = "\(home)/.grok/active_sessions.json"
-            if let data = try? Data(contentsOf: URL(fileURLWithPath: grokSessionsPath)),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-                for s in json {
-                    if let pid = s["pid"] as? Int, kill(pid_t(pid), 0) == 0 {
-                        report.activeGrokCount += 1
-                    }
+
+            // 9. 孤儿：ppid==1 + 无监听端口 + 非白名单 + 非 launchd 托管 + runner + MCP 签名
+            //    放过的都记下原因，面板要能解释"为什么没动它"
+            let launchdTokens = launchdProtectedTokens()
+            var orphanRoots = Set<Int>()
+            var protectedList: [ProtectedProc] = []
+            for (pid, p) in procs where p.ppid == 1 {
+                let lower = p.cmd.lowercased()
+                guard isRunner(lower), allKeywords.contains(where: { lower.contains($0) }) else { continue }
+                if CodexProcessMonitor.role(command: p.cmd) != nil {
+                    protectedList.append(ProtectedProc(pid: pid, cmd: p.cmd, memMB: p.memMB, reason: L("Codex 宿主或会话进程，父进程退出不等于会话结束", "Codex host or session; parent exit does not imply task completion")))
+                    continue
+                }
+                if listeningPids.contains(pid) {
+                    protectedList.append(ProtectedProc(pid: pid, cmd: p.cmd, memMB: p.memMB, reason: "在监听端口（可能还有客户端会连）"))
+                    continue
+                }
+                if let hit = whitelist.first(where: { p.cmd.contains($0) }) {
+                    protectedList.append(ProtectedProc(pid: pid, cmd: p.cmd, memMB: p.memMB, reason: "白名单：\(hit)"))
+                    continue
+                }
+                if let hit = launchdTokens.first(where: { p.cmd.contains($0.token) }) {
+                    protectedList.append(ProtectedProc(pid: pid, cmd: p.cmd, memMB: p.memMB, reason: "launchd 托管：\(hit.label)"))
+                    continue
+                }
+                orphanRoots.insert(pid)
+            }
+            report.protected = protectedList.sorted { $0.memMB > $1.memMB }
+            var allOrphans = orphanRoots
+            var stack = Array(orphanRoots)
+            while let curr = stack.popLast() {
+                for (pid, p) in procs where p.ppid == curr && !allOrphans.contains(pid) {
+                    allOrphans.insert(pid)
+                    stack.append(pid)
                 }
             }
+            var groupMap: [String: (count: Int, mem: Double, pids: [Int])] = [:]
+            for pid in allOrphans {
+                guard let p = procs[pid] else { continue }
+                let lower = p.cmd.lowercased()
+                let name = serviceDefinitions.first(where: { lower.contains($0.key) })?.name ?? "其他已退出 AI 进程"
+                var g = groupMap[name, default: (0, 0.0, [])]
+                g.count += 1
+                g.mem += p.memMB
+                g.pids.append(pid)
+                groupMap[name] = g
+            }
+            report.orphanedGroups = groupMap.map { ServiceGroup(serviceName: $0.key, processCount: $0.value.count, totalMemMB: $0.value.mem, pids: $0.value.pids) }
+                .sorted { $0.totalMemMB > $1.totalMemMB }
+            report.orphans = allOrphans.compactMap { pid -> OrphanProc? in
+                guard let p = procs[pid] else { return nil }
+                let lower = p.cmd.lowercased()
+                let name = serviceDefinitions.first(where: { lower.contains($0.key) })?.name ?? "其他已退出 AI 进程"
+                return OrphanProc(pid: pid, cmd: p.cmd, memMB: p.memMB, service: name)
+            }.sorted { $0.memMB > $1.memMB }
+            report.allOrphanPids = Array(allOrphans)
+            report.totalOrphanCount = allOrphans.count
+            report.totalOrphanMemMB = report.orphanedGroups.reduce(0.0) { $0 + $1.totalMemMB }
+
+            // 10. Token 遥测 + 11. 各平台档位/额度 + 12. API Key 调用
+            report.tokens = scanTokens()
+            report.detectedLLMs = withQuotaSamples(detectAllLLMRuntimes(counts))
+            report.codexProcesses = counts.codexProcesses
+            report.codexProcessDevices = processReadSucceeded && !codexProcessMonitor.inventoryLimited ? ["local"] : []
+            report.codexProcessErrors = !processReadSucceeded ? ["local": L("无法读取本机进程表", "Local process table unavailable")] :
+                codexProcessMonitor.inventoryLimited ? ["local": L("部分 Codex 进程已退出或无法读取", "Some Codex processes exited or could not be read")] : [:]
+            report.accountPresence = accountPresenceCollector.snapshot(force: forceSlow)
+            report.api = scanAPI()
+            report.cliUsage = scanCLIUsage(claude: report.tokens)
+            slowReport = report
+            lastSlowScanAt = now
         }
-        
-        // 9. 甄别断链孤儿进程
-        var orphanRootPids = Set<Int>()
-        for (pid, proc) in allProcs {
-            if proc.ppid != 1 { continue }
-            if listeningPids.contains(pid) { continue }
-            
-            let cmd = proc.cmd
-            let lowerCmd = cmd.lowercased()
-            
-            if whitelist.contains(where: { cmd.contains($0) }) {
+        report.remoteHosts = RemoteCollector.devices()
+        remoteLock.lock()
+        report.remoteLLMs = remoteLLMs.filter { report.remoteHosts.contains($0.key) }
+        report.remoteDeviceStatus = remoteDeviceStatus.filter { report.remoteHosts.contains($0.key) }
+        // Start with this local snapshot, then bind remote rows to the registered host.
+        // No stale remote inventory survives a failed/legacy summary response.
+        report.codexProcesses = report.codexProcesses.filter { $0.deviceID == "local" }
+        report.codexProcessDevices = report.codexProcessDevices.filter { $0 == "local" }
+        report.codexProcessErrors = report.codexProcessErrors.filter { $0.key == "local" }
+        report.accountPresence = report.accountPresence.filter { $0.deviceID == "local" }
+        // Legacy/unavailable remote collectors cannot establish logout. Each
+        // failed/missing tool becomes unconfirmed, never a stale logged-in claim.
+        let presenceNow = Date().timeIntervalSince1970
+        for host in report.remoteHosts {
+            let current = remoteProcessErrors[host] == nil ? remoteSummary[host]?.accountPresence : nil
+            report.accountPresence += AccountPresenceCollector.completingDevice(current, deviceID: host, now: presenceNow)
+        }
+        for host in report.remoteHosts {
+            if let error = remoteProcessErrors[host] { report.codexProcessErrors[host] = error; continue }
+            guard let summary = remoteSummary[host] else {
+                report.codexProcessErrors[host] = L("本设备进程尚未采集", "Process inventory not collected for this device")
                 continue
             }
-            
-            let isRunner = lowerCmd.contains("node") || lowerCmd.contains("npm") || lowerCmd.contains("python") || lowerCmd.contains("uv")
-            let hasSignature = allKeywords.contains(where: { lowerCmd.contains($0) })
-            
-            if isRunner && hasSignature {
-                orphanRootPids.insert(pid)
+            guard let processes = summary.codexProcesses else {
+                report.codexProcessErrors[host] = L("远端采集器未提供进程数据", "Remote collector did not provide process data")
+                continue
             }
+            report.codexProcesses += processes
+            if summary.codexProcessesLimited {
+                report.codexProcessErrors[host] = L("远端进程清单采集不完整", "Remote process inventory is incomplete")
+            } else { report.codexProcessDevices.append(host) }
         }
-        
-        // 递归追踪孤儿的子进程
-        var allOrphanPids = Set(orphanRootPids)
-        var stack = Array(orphanRootPids)
-        while !stack.isEmpty {
-            let curr = stack.removeLast()
-            for (p, proc) in allProcs {
-                if proc.ppid == curr && !allOrphanPids.contains(p) {
-                    allOrphanPids.insert(p)
-                    stack.append(p)
-                }
-            }
-        }
-        
-        // 按可读服务名聚类
-        var groupMap: [String: (count: Int, mem: Double, pids: [Int])] = [:]
-        for pid in allOrphanPids {
-            guard let proc = allProcs[pid] else { continue }
-            let lowerCmd = proc.cmd.lowercased()
-            
-            var matchedName = "其他已退出 AI 进程"
-            for def in serviceDefinitions {
-                if lowerCmd.contains(def.key) {
-                    matchedName = def.name
-                    break
-                }
-            }
-            
-            var curr = groupMap[matchedName, default: (count: 0, mem: 0.0, pids: [])]
-            curr.count += 1
-            curr.mem += proc.memMB
-            curr.pids.append(pid)
-            groupMap[matchedName] = curr
-        }
-        
-        var groups: [ServiceGroup] = []
-        for (name, val) in groupMap {
-            groups.append(ServiceGroup(
-                serviceName: name,
-                processCount: val.count,
-                totalMemMB: val.mem,
-                pids: val.pids
-            ))
-        }
-        
-        groups.sort { $0.totalMemMB > $1.totalMemMB }
-        report.orphanedGroups = groups
-        report.allOrphanPids = Array(allOrphanPids)
-        report.totalOrphanCount = allOrphanPids.count
-        report.totalOrphanMemMB = groups.reduce(0.0) { $0 + $1.totalMemMB }
-        
-        // 10. Token & Prompt Cache 实时与累计遥测
-        report.tokens = scanTokens()
-        
-        // 11. 多模型全景感知与各模型专属额度汇聚
-        report.detectedLLMs = detectAllLLMRuntimes(
-            claudeCount: report.activeClaudeCount,
-            codexCount: report.activeCodexCount,
-            agyCount: report.activeAgyCount,
-            grokCount: report.activeGrokCount,
-            hasOllama: hasOllama,
-            hasCursor: hasCursor,
-            hasLMStudio: hasLMStudio,
-            tokens: report.tokens
-        )
-        
+        remoteLock.unlock()
+        report.capturedAt = Date().timeIntervalSince1970
         return report
     }
-    
-    // 档位与鉴权特征判别
-    private func getClaudeTier() -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let claudeJson = "\(home)/.claude.json"
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: claudeJson)),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let oa = json["oauthAccount"] as? [String: Any] {
-            let rateTier = oa["organizationRateLimitTier"] as? String ?? ""
-            if rateTier.contains("max") {
-                return "Max 5x"
-            } else if rateTier.contains("team") {
-                return "Team"
-            } else if rateTier.contains("pro") {
-                return "Pro"
-            }
-            let billing = oa["billingType"] as? String ?? ""
-            if billing.contains("subscription") {
-                return "Pro"
-            }
-        }
-        if ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"] != nil {
-            return "API Key"
-        }
-        return "Max 5x"
+
+    /// 轻量探查（1s ticker）：只跑 ps 与小文件读取
+    public func scanActiveLLMs() -> [DetectedLLMRuntime] {
+        lock.lock(); defer { lock.unlock() }
+        return withQuotaSamples(detectAllLLMRuntimes(countSessions(readProcs())))
     }
-    
-    private func getCodexTier() -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let authPath = "\(home)/.codex/auth.json"
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let toks = json["tokens"] as? [String: Any],
-               let idTok = toks["id_token"] as? String {
-                let parts = idTok.split(separator: ".")
-                if parts.count >= 2 {
-                    var payloadStr = String(parts[1])
-                    let rem = payloadStr.count % 4
-                    if rem > 0 { payloadStr += String(repeating: "=", count: 4 - rem) }
-                    if let pData = Data(base64Encoded: payloadStr),
-                       let pJson = try? JSONSerialization.jsonObject(with: pData) as? [String: Any],
-                       let authObj = pJson["https://api.openai.com/auth"] as? [String: Any],
-                       let plan = authObj["chatgpt_plan_type"] as? String {
-                        if plan.contains("prolite") || plan.contains("5x") || plan.contains("pro") {
-                            return "Pro 5x"
-                        } else if plan.contains("team") {
-                            return "Team"
-                        } else if plan.contains("plus") {
-                            return "Plus"
-                        }
+
+    /// 统一在出口处记额度采样并回填"近期速度"——全扫描与面板每秒的轻量刷新都走这里
+    private func withQuotaSamples(_ llms: [DetectedLLMRuntime]) -> [DetectedLLMRuntime] {
+        let now = Date().timeIntervalSince1970
+        let out = llms.map { var l = $0; sampleLLMQuotas(&l, now: now); return l }
+        saveSamplesIfDue(now)      // 整轮记完再落盘，别让同一轮后面的键等下一个周期
+        return out
+    }
+
+    // MARK: 磁盘占用与会话日志治理
+
+    /// 保留天数（`defaults write io.github.xixilys.vibedeck logRetentionDays 60` 可改，下限 7 天）
+    public var logRetentionDays: Int {
+        let v = UserDefaults.standard.integer(forKey: "logRetentionDays")
+        return v >= 7 ? v : 30
+    }
+
+    /// 保留期硬下限 7 天：本工具自己要读近两天的会话文件算额度，太短会把还在用的删掉
+    public static func effectiveRetention(_ days: Int) -> Int { max(7, days) }
+
+    /// 允许按年龄清理的目录：只有「会话记录」。删掉的后果写在 note 里，面板要原样显示给用户看。
+    /// 绝不放进来的：sqlite 运行库（删了工具会坏）、plugins/skills（是安装的东西）、
+    /// generated_images/downloads（是用户资产）。这些只统计、不提供按钮。
+    private var purgeableDirs: [(path: String, label: String, note: String)] {
+        [("\(home)/.codex/sessions", "Codex 会话记录", "删掉就不能 --resume 这些旧会话"),
+         ("\(home)/.grok/sessions", "Grok 会话记录", "删掉就不能回看这些旧会话"),
+         ("\(home)/.claude/projects", "Claude 会话记录", "删掉就不能 --resume / --continue 这些旧会话")]
+    }
+
+    /// 只统计不清理的大块（让用户自己判断，而不是我们替他删）
+    private var reportOnlyPaths: [(path: String, label: String, note: String)] {
+        [("\(home)/.codex/logs_2.sqlite", "Codex 日志库", "运行时数据库，删了会弄坏 Codex"),
+         ("\(home)/.codex/thread_history_1.sqlite", "Codex 会话库", "运行时数据库，删了会弄坏 Codex"),
+         ("\(home)/.codex/generated_images", "Codex 生成的图片", "你的产物，自己决定"),
+         ("\(home)/.grok/downloads", "Grok 下载", "你的产物，自己决定"),
+         ("\(home)/.codex/plugins", "Codex 插件", "装上的东西，不是缓存"),
+         ("\(home)/.claude/plugins", "Claude 插件", "装上的东西，不是缓存")]
+    }
+
+    private func diskStatsSnapshot() -> (items: [DiskItem], totalGB: Double, known: Bool, pending: Bool) {
+        let now = Date().timeIntervalSince1970
+        resourceStateLock.lock()
+        if let cache = diskCache, now - cache.at < 600 {
+            resourceStateLock.unlock()
+            return (cache.items, cache.totalGB, true, false)
+        }
+        if !diskScanPending && now - diskLastAttemptAt >= 600 {
+            diskScanPending = true
+            diskLastAttemptAt = now
+            let generation = diskScanGeneration
+            resourceQueue.async { [weak self] in
+                guard let self else { return }
+                let measured: (items: [DiskItem], totalGB: Double)?
+                if let override = self.diskMeasurementOverride { measured = override() }
+                else { measured = self.measureDiskStats() }
+                let finishedAt = Date().timeIntervalSince1970
+                self.resourceStateLock.lock()
+                let invalidated = generation != self.diskScanGeneration
+                if !invalidated, let measured {
+                    self.diskCache = (finishedAt, measured.items, measured.totalGB)
+                }
+                if !invalidated && measured == nil { self.diskLastAttemptAt = finishedAt }
+                self.diskScanPending = false
+                self.resourceStateLock.unlock()
+                if invalidated { _ = self.diskStatsSnapshot() }
+            }
+        }
+        let cache = diskCache
+        let pending = diskScanPending
+        resourceStateLock.unlock()
+        return (cache?.items ?? [], cache?.totalGB ?? 0, cache != nil, pending)
+    }
+
+    /// Nonblocking compatibility API: requests a refresh and returns the latest completed snapshot.
+    /// Use `ScanReport.diskStatsKnown/diskStatsPending` to distinguish an initial empty result from 0 GB.
+    public func scanDisk() -> (items: [DiskItem], totalGB: Double) {
+        let snapshot = scanDiskSnapshot()
+        return (snapshot.items, snapshot.totalGB)
+    }
+
+    /// Nonblocking snapshot API for direct callers that need to distinguish pending from measured zero.
+    public func scanDiskSnapshot() -> (items: [DiskItem], totalGB: Double, known: Bool, pending: Bool) {
+        return diskStatsSnapshot()
+    }
+
+    private func npxCacheSnapshot() -> (value: Double, known: Bool, pending: Bool) {
+        let now = Date().timeIntervalSince1970
+        resourceStateLock.lock()
+        if npxCleanupPending {
+            resourceStateLock.unlock()
+            return (0, false, true)
+        }
+        if let cache = npxCache, now - cache.at < 300 {
+            resourceStateLock.unlock()
+            return (cache.mb, true, false)
+        }
+        if !npxScanPending && now - npxLastAttemptAt >= 300 {
+            npxScanPending = true
+            npxLastAttemptAt = now
+            let generation = npxScanGeneration
+            resourceQueue.async { [weak self] in
+                guard let self else { return }
+                let measured: Double?
+                if let override = self.npxMeasurementOverride { measured = override() }
+                else { measured = self.measureNPXCacheMB() }
+                let finishedAt = Date().timeIntervalSince1970
+                self.resourceStateLock.lock()
+                let invalidated = generation != self.npxScanGeneration
+                if !invalidated, let measured {
+                    self.npxCache = (measured, finishedAt)
+                }
+                if !invalidated && measured == nil { self.npxLastAttemptAt = finishedAt }
+                let cleanupPending = self.npxCleanupPending
+                self.npxScanPending = false
+                self.resourceStateLock.unlock()
+                if invalidated && !cleanupPending { _ = self.npxCacheSnapshot() }
+            }
+        }
+        let value = npxCache
+        let pending = npxScanPending
+        resourceStateLock.unlock()
+        return (value?.mb ?? 0, value != nil, pending)
+    }
+
+    private func measureNPXCacheMB() -> Double? {
+        switch directorySizeKB("\(home)/.npm/_npx") {
+        case .missing: return 0
+        case .failed: return nil
+        case .measured(let kb): return kb / 1024
+        }
+    }
+
+    private func invalidateNPXCache() {
+        resourceStateLock.lock()
+        npxCache = nil
+        npxScanGeneration += 1
+        npxLastAttemptAt = 0
+        resourceStateLock.unlock()
+    }
+
+    private func invalidateDiskStatsCache() {
+        resourceStateLock.lock()
+        diskCache = nil
+        diskScanGeneration += 1
+        diskLastAttemptAt = 0
+        resourceStateLock.unlock()
+    }
+
+    /// Narrow test seam: uses the same nonblocking request path and reports whether either snapshot is pending.
+    func requestStorageStatsForTesting() -> (npxMB: Double, npxKnown: Bool, npxPending: Bool,
+                                              diskItems: [DiskItem], diskTotalGB: Double,
+                                              diskKnown: Bool, diskPending: Bool) {
+        let npx = npxCacheSnapshot()
+        let disk = diskStatsSnapshot()
+        return (npx.value, npx.known, npx.pending, disk.items, disk.totalGB, disk.known, disk.pending)
+    }
+
+    func invalidateStorageStatsForTesting() {
+        invalidateNPXCache()
+        invalidateDiskStatsCache()
+    }
+
+    private func measureDiskStats() -> (items: [DiskItem], totalGB: Double)? {
+        let cutoff = Date().timeIntervalSince1970 - Double(logRetentionDays) * 86400
+        var items: [DiskItem] = []
+
+        for directory in purgeableDirs {
+            if vgFileStat(directory.path) == nil { continue }
+            let command = "/usr/bin/find \(shellQuote(directory.path)) -type f -exec /usr/bin/stat -f '%z %m' {} + 2>/dev/null"
+            guard let output = runShellChecked(command) else { return nil }
+            var item = DiskItem(path: directory.path, label: directory.label, purgeable: true, note: directory.note)
+            for line in output.split(separator: "\n") {
+                let parts = line.split(separator: " ")
+                guard parts.count == 2, let size = Double(parts[0]), let mtime = Double(parts[1]) else { continue }
+                item.files += 1
+                item.totalMB += size / 1_048_576
+                if mtime < cutoff {
+                    item.oldFiles += 1
+                    item.oldMB += size / 1_048_576
+                }
+            }
+            items.append(item)
+        }
+
+        for path in reportOnlyPaths {
+            let kb: Double
+            switch directorySizeKB(path.path) {
+            case .missing: continue
+            case .failed: return nil
+            case .measured(let value): kb = value
+            }
+            let mb = kb / 1024
+            if mb >= 50 {
+                items.append(DiskItem(path: path.path, label: path.label, totalMB: mb, purgeable: false, note: path.note))
+            }
+        }
+
+        var totalGB = 0.0
+        for root in [".codex", ".grok", ".claude", ".gemini"] {
+            switch directorySizeKB("\(home)/\(root)") {
+            case .missing: continue
+            case .failed: return nil
+            case .measured(let value): totalGB += value / 1_048_576
+            }
+        }
+        items.sort { $0.totalMB > $1.totalMB }
+        return (items, totalGB)
+    }
+
+    private enum DirectorySizeResult { case missing, failed, measured(Double) }
+
+    private func directorySizeKB(_ path: String) -> DirectorySizeResult {
+        guard vgFileStat(path) != nil else { return .missing }
+        guard let output = runProcess("/usr/bin/du", ["-sk", path]),
+              let first = output.split(whereSeparator: { $0 == "\t" || $0.isWhitespace }).first,
+              let size = Double(first) else { return .failed }
+        return .measured(size)
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private func runShellChecked(_ command: String) -> String? {
+        runProcess("/bin/zsh", ["-c", command])
+    }
+
+    private func runProcess(_ executable: String, _ arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            return String(data: data, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }
+
+    /// 清理超过保留期的会话记录。**放回收站而不是 rm** —— 误删了还能捞回来。
+    /// 四道闸：目录必须在白名单里、必须是普通文件、mtime 必须早于截止点、保留期下限 7 天。
+    public func purgeOldSessionLogs(olderThanDays: Int) -> (files: Int, freedMB: Double, failed: Int) {
+        let days = Self.effectiveRetention(olderThanDays)
+        let cutoff = Date().timeIntervalSince1970 - Double(days) * 86400
+        let fm = FileManager.default
+        var files = 0, failed = 0
+        var freed = 0.0
+
+        for d in purgeableDirs {
+            let root = URL(fileURLWithPath: d.path).resolvingSymlinksInPath().standardizedFileURL
+            guard let e = fm.enumerator(at: URL(fileURLWithPath: d.path),
+                                        includingPropertiesForKeys: [.isSymbolicLinkKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]) else { continue }
+            for case let url as URL in e {
+                guard let v = try? url.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey]),
+                      v.isSymbolicLink == false,
+                      url.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(root.path + "/"), // 闸 1：解析链接后仍在白名单目录
+                      v.isRegularFile == true,                                  // 闸 2：只动普通文件
+                      let mt = v.contentModificationDate, mt.timeIntervalSince1970 < cutoff  // 闸 3：确实够旧
+                else { continue }
+                let size = Double(v.fileSize ?? 0) / 1_048_576
+                do {
+                    try fm.trashItem(at: url, resultingItemURL: nil)            // 闸 4：进回收站，可恢复
+                    files += 1
+                    freed += size
+                } catch {
+                    failed += 1
+                }
+            }
+        }
+        invalidateDiskStatsCache()
+        log.notice("清理会话记录：\(days) 天前，\(files) 个文件，\(Int(freed)) MB，失败 \(failed)")
+        return (files, freed, failed)
+    }
+
+    func measureDiskStatsForTesting() -> (items: [DiskItem], totalGB: Double)? { measureDiskStats() }
+
+    // MARK: 档位（只报数据里真实有的，查不到就说查不到，不猜）
+
+    /// 没额度数据时说清楚原因：走第三方端点（没有订阅额度可读）/ 没装 statusLine 截获 / 等下一轮对话。
+    private func claudeQuotaHint(hasQuota: Bool) -> String {
+        let settings = readJSON("\(home)/.claude/settings.json")
+        let baseURL = ((settings?["env"] as? [String: Any])?["ANTHROPIC_BASE_URL"] as? String) ?? env["ANTHROPIC_BASE_URL"] ?? ""
+        if let host = URL(string: baseURL)?.host, !host.hasSuffix("anthropic.com") {
+            return "走 \(host)，无订阅额度"
+        }
+        if settings?["statusLine"] == nil { return "未配置 statusLine，无额度" }
+        return "等 Claude Code 下一轮对话刷新额度"
+    }
+
+    private func getClaudeTier() -> String {
+        let baseURL = ((readJSON("\(home)/.claude/settings.json")?["env"] as? [String: Any])?["ANTHROPIC_BASE_URL"] as? String) ?? env["ANTHROPIC_BASE_URL"] ?? ""
+        if let host = URL(string: baseURL)?.host, !host.hasSuffix("anthropic.com") { return "API" }
+        if let oa = readJSON("\(home)/.claude.json")?["oauthAccount"] as? [String: Any] {
+            let rate = (oa["organizationRateLimitTier"] as? String ?? "").lowercased()   // e.g. default_claude_max_5x
+            if rate.contains("max_20x") { return "Max 20x" }
+            if rate.contains("max_5x") { return "Max 5x" }
+            if rate.contains("max") { return "Max" }
+            if rate.contains("enterprise") { return "Enterprise" }
+            if rate.contains("team") { return "Team" }
+            if rate.contains("pro") { return "Pro" }
+            let orgType = (oa["organizationType"] as? String ?? "").lowercased()          // e.g. claude_max
+            if orgType.contains("max") { return "Max" }
+            if orgType.contains("pro") { return "Pro" }
+            if (oa["billingType"] as? String ?? "").contains("subscription") { return "订阅" }
+            return "已登录"
+        }
+        if env["ANTHROPIC_API_KEY"] != nil { return "API Key" }
+        return "未登录"
+    }
+
+    /// OpenAI JWT 里的 chatgpt_plan_type → 展示名。没有 "5x" 这种档位，那是 Claude 的叫法。
+    public static func codexPlanLabel(_ plan: String) -> String {
+        switch plan.lowercased() {
+        case "prolite": return "Pro Lite"
+        case "pro": return "Pro"
+        case "plus": return "Plus"
+        case "go": return "Go"
+        case "team", "business": return "Team"
+        case "enterprise": return "Enterprise"
+        case "edu": return "Edu"
+        case "free": return "Free"
+        case "": return ""
+        default: return plan.prefix(1).uppercased() + plan.dropFirst()
+        }
+    }
+
+    private func getCodexTier(sessionPlan: String) -> String {
+        if let auth = readJSON("\(home)/.codex/auth.json") {
+            if let idTok = (auth["tokens"] as? [String: Any])?["id_token"] as? String {
+                let segs = idTok.split(separator: ".")
+                if segs.count >= 2 {
+                    var payload = String(segs[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+                    let rem = payload.count % 4
+                    if rem > 0 { payload += String(repeating: "=", count: 4 - rem) }
+                    if let d = Data(base64Encoded: payload),
+                       let p = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                       let plan = (p["https://api.openai.com/auth"] as? [String: Any])?["chatgpt_plan_type"] as? String,
+                       !plan.isEmpty {
+                        return ProcessScanner.codexPlanLabel(plan)
                     }
                 }
             }
-            let mode = json["auth_mode"] as? String ?? ""
-            if mode == "chatgpt" { return "Pro 5x" }
-            if mode == "api_key" { return "API Key" }
+            if !sessionPlan.isEmpty { return ProcessScanner.codexPlanLabel(sessionPlan) }
+            let mode = auth["auth_mode"] as? String ?? ""
+            if mode == "chatgpt" { return "ChatGPT 登录" }
+            if mode == "api_key" || auth["OPENAI_API_KEY"] != nil { return "API Key" }
         }
-        if ProcessInfo.processInfo.environment["OPENAI_API_KEY"] != nil {
-            return "API Key"
-        }
-        return "Pro 5x"
-    }
-    
-    private func getGeminiTier() -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let tokenPath = "\(home)/.gemini/antigravity-cli/antigravity-oauth-token"
-        
-        if FileManager.default.fileExists(atPath: tokenPath) {
-            // 1. 检查是否存在 Google One AI Premium / Gemini Advanced 双额度池 (Gemini + 3P Claude/GPT)
-            let cachePath = "\(home)/.cache/agy-hud/quota_cache.json"
-            if let data = try? Data(contentsOf: URL(fileURLWithPath: cachePath)),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let pools = json["pools"] as? [String: Any] {
-                if pools["3p"] != nil || pools["gemini"] != nil {
-                    return "Advanced"
-                }
-            }
-            
-            // 2. 检查 OAuth 认证类型 (consumer 即 Google One 个人高级订阅)
-            if let data = try? Data(contentsOf: URL(fileURLWithPath: tokenPath)),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                if let method = json["auth_method"] as? String, method == "consumer" {
-                    return "Advanced"
-                }
-            }
-            return "Advanced"
-        }
-        
-        if ProcessInfo.processInfo.environment["GEMINI_API_KEY"] != nil {
-            return "API Key"
-        }
-        return "Free"
+        if env["OPENAI_API_KEY"] != nil { return "API Key" }
+        return "未登录"
     }
 
-    // 提取 Gemini 多额度池 (原生池与 Claude/GPT 三方池)
-    private func getGeminiDualPools() -> (native5h: Int?, nativeW: Int?, tp5h: Int?, tpW: Int?) {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let cachePath = "\(home)/.cache/agy-hud/quota_cache.json"
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: cachePath)),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let pools = json["pools"] as? [String: Any] else {
-            return (nil, nil, nil, nil)
+    /// Antigravity 本地没有套餐字段；新版 agy 连 token 文件都不落盘了 → 能拉到额度就是登录态
+    private func getGeminiTier(hasQuota: Bool) -> String {
+        if let tok = readJSON("\(home)/.gemini/antigravity-cli/antigravity-oauth-token") {
+            let method = (tok["auth_method"] as? String ?? "").lowercased()
+            return method == "consumer" ? "个人 OAuth" : "OAuth"
         }
-        
-        func extractPct(_ dict: [String: Any]?, key: String) -> Int? {
-            guard let sub = dict?[key] as? [String: Any],
-                  let rf = sub["remaining_fraction"] as? Double else {
-                return nil
-            }
-            return max(0, min(100, Int(round((1.0 - rf) * 100.0))))
-        }
-        
-        let g = pools["gemini"] as? [String: Any]
-        let tp = pools["3p"] as? [String: Any]
-        
-        let g5h = extractPct(g, key: "5h")
-        let gw = extractPct(g, key: "weekly")
-        let tp5h = extractPct(tp, key: "5h")
-        let tpw = extractPct(tp, key: "weekly")
-        
-        return (g5h, gw, tp5h, tpw)
+        if hasQuota { return "已登录" }
+        if env["GEMINI_API_KEY"] != nil { return "API Key" }
+        return "未登录"
     }
 
+    /// 直接用 grok 自己缓存的 subscription_tier_display（形如 "X Premium+" / "SuperGrok"），原样显示不改写
     private func getGrokTier() -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let settingsPath = "\(home)/.grok/settings_cache.json"
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: settingsPath)),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let payloadStr = json["payload"] as? String,
+        if let cache = readJSON("\(home)/.grok/settings_cache.json"),
+           let payloadStr = cache["payload"] as? String,
            let pData = payloadStr.data(using: .utf8),
            let pJson = try? JSONSerialization.jsonObject(with: pData) as? [String: Any],
            let settings = pJson["settings"] as? [String: Any] {
-            if let tierDisplay = settings["subscription_tier_display"] as? String, !tierDisplay.isEmpty {
-                if tierDisplay.contains("Premium") || tierDisplay.contains("SuperGrok") {
-                    return "SuperGrok"
-                }
-                return tierDisplay
+            if let display = settings["subscription_tier_display"] as? String, !display.isEmpty { return display }
+            if let tier = settings["subscription_tier"] as? String, !tier.isEmpty { return tier }
+        }
+        if let auth = readJSON("\(home)/.grok/auth.json") {
+            for v in auth.values {
+                if let d = v as? [String: Any], d["auth_mode"] as? String == "oidc" { return "已登录" }
             }
         }
-        
-        let authPath = "\(home)/.grok/auth.json"
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: authPath)),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            for (_, v) in json {
-                if let dict = v as? [String: Any] {
-                    if let mode = dict["auth_mode"] as? String, mode == "oidc" {
-                        return "SuperGrok"
+        if env["XAI_API_KEY"] != nil || env["GROK_API_KEY"] != nil { return "API Key" }
+        return "未登录"
+    }
+
+    // MARK: 额度（全部带 resets_at + 采集时间）
+
+    /// Claude：statusline 截获后写入 ~/.claude/claude-usage.json（Claude Code 下发的整个 rate_limits 对象）。
+    /// 目前只有 five_hour / seven_day；若将来出现按模型的窗口键（如 seven_day_fable），自动当副池显示，键名即池名。
+    private func readClaudeQuota() -> (fiveHour: QuotaWindow?, sevenDay: QuotaWindow?, extraName: String, extra5h: QuotaWindow?, extraW: QuotaWindow?) {
+        guard let json = readJSON("\(home)/.claude/claude-usage.json") else { return (nil, nil, "", nil, nil) }
+        return parseClaudeQuota(json)
+    }
+
+    /// 解析 Claude 额度对象。本机读文件、远程由采集器把同一份原文带回来，两边共用这一份口径。
+    private func parseClaudeQuota(_ json: [String: Any]) -> (fiveHour: QuotaWindow?, sevenDay: QuotaWindow?, extraName: String, extra5h: QuotaWindow?, extraW: QuotaWindow?) {
+        let captured = (json["_captured_at"] as? NSNumber)?.doubleValue
+        func win(_ d: Any?, _ windowSeconds: Double) -> QuotaWindow? {
+            guard let d = d as? [String: Any], let used = clampPct(d["used_percentage"] as? NSNumber) else { return nil }
+            return QuotaWindow(usedPct: used, resetsAt: (d["resets_at"] as? NSNumber)?.doubleValue,
+                               capturedAt: captured, windowSeconds: windowSeconds,
+                               rawUsedPercent: RemoteCollector.finiteNumber(d["used_percentage"]))
+        }
+        var extraName = ""
+        var extra5h: QuotaWindow? = nil
+        var extraW: QuotaWindow? = nil
+        for (k, v) in json where !["five_hour", "seven_day", "_captured_at"].contains(k) {
+            guard let w = win(v, k.hasPrefix("five_hour") ? 5 * 3600 : 7 * 86400) else { continue }
+            let base = k.replacingOccurrences(of: "seven_day_", with: "").replacingOccurrences(of: "five_hour_", with: "")
+            let name = base.prefix(1).uppercased() + base.dropFirst()
+            guard extraName.isEmpty || extraName == name else { continue }   // 只展示一个副池
+            extraName = name
+            if k.hasPrefix("five_hour") { extra5h = w } else { extraW = w }
+        }
+        return (win(json["five_hour"], 5 * 3600), win(json["seven_day"], 7 * 86400), extraName, extra5h, extraW)
+    }
+
+    // MARK: Codex 额度（按 limit_id 分桶：主桶 "codex"，新版 CLI 另报如 codex_bengalfox/Spark；本机 + 远程合并取最新）
+
+    private struct CodexBucket {
+        var id: String            // limit_id；旧版 CLI 不带 → 视为 "codex"
+        var name: String          // limit_name，如 "GPT-5.3-Codex-Spark"
+        var fiveHour: QuotaWindow?
+        var weekly: QuotaWindow?
+        var plan: String
+        var captured: TimeInterval
+        var account: AccountIdentity? = nil
+    }
+    /// 额度打满：请求被拒时 Codex 写 rate_limits 但百分比全为 null，真信号在 task_complete 的
+    /// error.codex_error_info == "usage_limit_exceeded"，重置时刻在 error.message 文案里。
+    private struct CodexLimitHit {
+        var at: TimeInterval
+        var resetsAt: TimeInterval?
+        var account: AccountIdentity? = nil
+    }
+    private struct CodexParse {
+        var buckets: [String: CodexBucket] = [:]
+        var limitHit: CodexLimitHit? = nil
+    }
+    private var codexFileCache: [String: (mtime: TimeInterval, parsed: CodexParse)] = [:]
+
+    private let remoteLock = NSLock()
+    private var remoteLLMs: [String: [DetectedLLMRuntime]] = [:]
+    private var remoteDeviceStatus: [String: RemoteDeviceStatus] = [:]
+    private var quotaInFlight = Set<String>()
+    private let quotaQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "VibeDeck.remoteQuotas"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 3
+        return queue
+    }()
+    private let summaryQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "VibeDeck.remoteSummary"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = 2
+        return queue
+    }()
+
+    /// 跑 Codex 的远程机器，可配多台（默认空 = 关闭远程合并）。
+    /// 开启：`defaults write io.github.xixilys.vibedeck remoteHosts "wsl-box gpu-host"`，每台都要能免密 ssh。
+    /// 旧的单机键 `codexRemoteHost` 仍然认。
+    public var codexRemoteHosts: [String] { RemoteCollector.hosts() }
+
+    /// 这个值会被拼进 `ssh <host> '...'` 的 shell 命令，所以只放行合法主机名/别名/user@host。
+    /// 虽然只有本机用户能写这个 UserDefaults，但拼 shell 就该校验 —— 别给分号和反引号留门。
+    public static func isValidSSHHost(_ h: String) -> Bool {
+        guard !h.isEmpty, h.count <= 255 else { return false }
+        return h.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]*(@[A-Za-z0-9][A-Za-z0-9._-]*)?$"#, options: .regularExpression) != nil
+    }
+
+    public func codexRemoteStatus() -> (hosts: [String], ok: Bool, ageSeconds: Int) {
+        let hosts = codexRemoteHosts
+        remoteLock.lock(); defer { remoteLock.unlock() }
+        let statuses = hosts.compactMap { remoteDeviceStatus[$0] }
+        let last = statuses.compactMap { $0.lastSuccess }.max()
+        return (hosts, statuses.contains { $0.lastSuccess != nil && $0.error.isEmpty }, last.map { Int(max(0, Date().timeIntervalSince1970 - $0)) } ?? 0)
+    }
+
+    public func codexRemoteHostStatus() -> [(host: String, ok: Bool, ageSeconds: Int)] {
+        let hosts = codexRemoteHosts
+        remoteLock.lock(); defer { remoteLock.unlock() }
+        let now = Date().timeIntervalSince1970
+        return hosts.map { host in
+            let entry = remoteDeviceStatus[host]
+            return (host, entry?.lastSuccess != nil && entry?.error.isEmpty == true,
+                    entry?.lastSuccess.map { Int(max(0, now - $0)) } ?? 0)
+        }
+    }
+
+    // MARK: 远程「今日用量」（采集器 --summary；5 分钟一次）
+
+    /// 一台远程主机已知的额度。没采集到的就是 nil，面板如实显示「未采集」。
+    public struct RemoteQuota {
+        public var codexFiveHour: QuotaWindow?
+        public var codexWeekly: QuotaWindow?
+        public var codexPlan: String = ""
+        public var claudeFiveHour: QuotaWindow?
+        public var claudeWeekly: QuotaWindow?
+    }
+
+    private var remoteSummary: [String: RemoteCollector.Summary] = [:]
+    private var remoteProcessErrors: [String: String] = [:]
+    private var summaryAttempt: [String: TimeInterval] = [:]
+    private var summaryInFlight = Set<String>()
+
+    /// History scans have their own queue and cadence; they never block local or quota refreshes.
+    public func refreshRemoteSummaryIfDue(force: Bool = false) {
+        let now = Date().timeIntervalSince1970
+        for host in codexRemoteHosts {
+            remoteLock.lock()
+            let due = !summaryInFlight.contains(host) && (force || now - (summaryAttempt[host] ?? 0) >= 300)
+            if due { summaryInFlight.insert(host); summaryAttempt[host] = now }
+            remoteLock.unlock()
+            guard due else { continue }
+            summaryQueue.addOperation { [self] in
+                let result = RemoteCollector.pullSummary(host: host)
+                remoteLock.lock()
+                switch result {
+                case .success(let summary):
+                    remoteSummary[host] = summary
+                    remoteProcessErrors[host] = nil
+                case .failure(let error):
+                    // Retain unrelated usage/quota history, but never retain live process claims.
+                    remoteSummary[host]?.codexProcesses = nil
+                    remoteProcessErrors[host] = error.message
+                }
+                summaryInFlight.remove(host)
+                remoteLock.unlock()
+            }
+        }
+    }
+
+    /// 每台远程主机今日各 CLI 的用量（给「按设备」视图用）。
+    public func remoteTodayByHost() -> [String: [CLIUsage]] {
+        remoteLock.lock(); let summaries = remoteSummary; remoteLock.unlock()
+        var out: [String: [CLIUsage]] = [:]
+        for (host, summary) in summaries {
+            var rows: [CLIUsage] = []
+            for key in ["opencode", "codex", "claude"] {
+                guard let today = summary.today[key] else { continue }
+                var usage = CLIUsage(name: Self.cliLabel(key))
+                usage.ctx = today.ctx; usage.cacheRead = today.cacheRead
+                usage.out = today.out; usage.think = today.think
+                usage.requests = today.requests; usage.turns = today.requests
+                rows.append(usage)
+            }
+            out[host] = rows
+        }
+        return out
+    }
+
+    /// Compatibility view for existing per-device cards; never merges accounts across hosts.
+    public func remoteQuotaByHost() -> [String: RemoteQuota] {
+        let hosts = codexRemoteHosts
+        remoteLock.lock(); let snapshots = remoteLLMs; remoteLock.unlock()
+        var out: [String: RemoteQuota] = [:]
+        for host in hosts {
+            let rows = snapshots[host] ?? []
+            let codex = rows.first { $0.name == "Codex" }
+            let claude = rows.first { $0.name == "Claude" }
+            out[host] = RemoteQuota(codexFiveHour: codex?.fiveHour, codexWeekly: codex?.sevenDay,
+                                    codexPlan: codex?.tier ?? "", claudeFiveHour: claude?.fiveHour, claudeWeekly: claude?.sevenDay)
+        }
+        return out
+    }
+
+    static func cliLabel(_ key: String) -> String {
+        switch key {
+        case "opencode": return "opencode"
+        case "codex": return "Codex"
+        case "claude": return "Claude Code"
+        default: return key
+        }
+    }
+
+    static func codexSessionIdentity(_ path: String) -> AccountIdentity? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let data = (try? handle.read(upToCount: 256 * 1024)) ?? Data()
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n").prefix(64) {
+            guard let raw = line.data(using: .utf8), let row = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any],
+                  row["type"] as? String == "session_meta" else { continue }
+            guard let payload = row["payload"] as? [String: Any], let provider = payload["model_provider"] as? String,
+                  let accountID = payload["creator_account_id"] as? String else { return nil }
+            return AccountIdentity(provider: provider, accountID: accountID)
+        }
+        return nil
+    }
+
+    private func claudeQuotaIdentity(capturedAt: TimeInterval?) -> AccountIdentity? {
+        // Old capture files cannot be attached to a newly logged-in account.
+        if let custom = env["CLAUDE_CONFIG_DIR"], !custom.isEmpty,
+           URL(fileURLWithPath: custom).standardizedFileURL.path != "\(home)/.claude" { return nil }
+        let settings = readJSON("\(home)/.claude/settings.json")
+        let route = ((settings?["env"] as? [String: Any])?["ANTHROPIC_BASE_URL"] as? String) ?? env["ANTHROPIC_BASE_URL"] ?? ""
+        if !route.isEmpty {
+            guard let host = URL(string: route)?.host, host == "anthropic.com" || host.hasSuffix(".anthropic.com") else { return nil }
+        }
+        let path = "\(home)/.claude.json"
+        guard let account = readJSON(path)?["oauthAccount"] as? [String: Any],
+              let subject = account["accountUuid"] as? String, let stamp = vgFileStat(path) else { return nil }
+        if let capturedAt { guard capturedAt.isFinite, capturedAt >= stamp.mtime else { return nil } }
+        else if readJSON("\(home)/.claude/claude-usage.json") != nil { return nil }
+        return AccountIdentity(provider: "anthropic", accountID: subject, workspaceID: account["organizationUuid"] as? String)
+    }
+
+    private func findRateLimits(_ x: Any) -> [String: Any]? {
+        guard let d = x as? [String: Any] else { return nil }
+        if d["primary"] != nil { return d }
+        for v in d.values { if let r = findRateLimits(v) { return r } }
+        return nil
+    }
+
+    /// 每个 limit_id 取采集时间最新的一条，并抓最新的"额度耗尽"事件。
+    /// 不能靠行序：远程输出是多文件拼接、顺序随机；半行/坏行直接跳过。
+    private func parseCodexText(_ text: String, fallbackTime: TimeInterval) -> CodexParse {
+        var out = CodexParse()
+        for l in text.components(separatedBy: "\n") {
+            let hasPct = l.contains("used_percent")
+            let hasHit = l.contains("usage_limit_exceeded")
+            guard hasPct || hasHit,
+                  let data = l.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            let ts = parseISO(json["timestamp"] as? String) ?? fallbackTime
+
+            if hasHit, let msg = findErrorMessage(json) {
+                if ts > (out.limitHit?.at ?? -1) {
+                    out.limitHit = CodexLimitHit(at: ts, resetsAt: Fmt.parseUsageLimitReset(msg))
+                }
+            }
+
+            guard hasPct, let rl = findRateLimits(json) else { continue }
+            let rawId = rl["limit_id"] as? String ?? ""
+            let id = rawId.isEmpty ? "codex" : rawId
+            if ts <= (out.buckets[id]?.captured ?? -1) { continue }
+            var b = CodexBucket(id: id, name: rl["limit_name"] as? String ?? "", fiveHour: nil, weekly: nil,
+                                plan: rl["plan_type"] as? String ?? "", captured: ts)
+            for key in ["primary", "secondary"] {
+                guard let w = rl[key] as? [String: Any], let used = clampPct(w["used_percent"] as? NSNumber) else { continue }
+                let mins = (w["window_minutes"] as? NSNumber)?.intValue ?? 0
+                let win = QuotaWindow(usedPct: used, resetsAt: (w["resets_at"] as? NSNumber)?.doubleValue, capturedAt: ts,
+                                      windowSeconds: mins > 0 ? Double(mins) * 60 : (mins >= 1440 ? 7 * 86400 : 5 * 3600),
+                                      rawUsedPercent: RemoteCollector.finiteNumber(w["used_percent"]))
+                if mins >= 1440 { b.weekly = win } else { b.fiveHour = win }
+            }
+            // 百分比全 null（请求被拒时就是这样）→ 不是有效快照，别覆盖旧的真值
+            if b.fiveHour != nil || b.weekly != nil { out.buckets[id] = b }
+        }
+        return out
+    }
+
+    private func findErrorMessage(_ x: Any) -> String? {
+        guard let d = x as? [String: Any] else { return nil }
+        if let e = d["error"] as? [String: Any] {
+            if (e["codex_error_info"] as? String) == "usage_limit_exceeded", let m = e["message"] as? String { return m }
+        }
+        for v in d.values { if let r = findErrorMessage(v) { return r } }
+        return nil
+    }
+
+    private func mergeNewest(_ into: inout CodexParse, _ src: CodexParse) {
+        for (id, b) in src.buckets where b.captured > (into.buckets[id]?.captured ?? -1) { into.buckets[id] = b }
+        if let h = src.limitHit, h.at > (into.limitHit?.at ?? -1) { into.limitHit = h }
+    }
+
+    /// 本机：近 7 天目录里 48h 内改过的会话文件，各取每桶最新；单文件按 mtime 缓存
+    private func readLocalCodex() -> CodexParse {
+        let fm = FileManager.default
+        let now = Date().timeIntervalSince1970
+        let df = DateFormatter()
+        df.dateFormat = "yyyy/MM/dd"
+        var files: [(path: String, mtime: TimeInterval)] = []
+        for back in 0..<7 {
+            let dir = "\(home)/.codex/sessions/\(df.string(from: Date(timeIntervalSinceNow: -Double(back) * 86400)))"
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for n in names where n.hasSuffix(".jsonl") {
+                let p = "\(dir)/\(n)"
+                if let probe = vgFileStat(p), now - probe.mtime < 48 * 3600 {
+                    files.append((p, probe.mtime))
+                }
+            }
+        }
+        var merged = CodexParse()
+        var seen = Set<String>()
+        for f in files {
+            seen.insert(f.path)
+            let parsed: CodexParse
+            if let c = codexFileCache[f.path], c.mtime == f.mtime {
+                parsed = c.parsed
+            } else {
+                let tailBytes = 256 * 1024
+                let tail = readTail(f.path, maxBytes: tailBytes)
+                var pr = parseCodexText(tail, fallbackTime: f.mtime)
+                if pr.buckets.isEmpty, pr.limitHit == nil, tail.utf8.count >= tailBytes {   // 尾部没有就全量
+                    pr = parseCodexText(readTail(f.path, maxBytes: Int.max), fallbackTime: f.mtime)
+                }
+                let account = Self.codexSessionIdentity(f.path)
+                for key in Array(pr.buckets.keys) { pr.buckets[key]?.account = account }
+                pr.limitHit?.account = account
+                parsed = pr
+                codexFileCache[f.path] = (f.mtime, pr)
+            }
+            mergeNewest(&merged, parsed)
+        }
+        codexFileCache = codexFileCache.filter { seen.contains($0.key) }
+        return merged
+    }
+
+    /// Cheap quota-only requests run concurrently; each host retains its own last successful snapshot.
+    public func refreshRemoteCodexIfDue(force: Bool = false) {
+        let now = Date().timeIntervalSince1970
+        for host in codexRemoteHosts {
+            remoteLock.lock()
+            let status = remoteDeviceStatus[host] ?? RemoteDeviceStatus()
+            let due = !quotaInFlight.contains(host) && (force || now - (status.lastAttempt ?? 0) >= 60)
+            if due {
+                quotaInFlight.insert(host)
+                var updated = status
+                updated.lastAttempt = now
+                remoteDeviceStatus[host] = updated
+            }
+            remoteLock.unlock()
+            guard due else { continue }
+            quotaQueue.addOperation { [self] in
+                let result = RemoteCollector.pullQuotas(host: host)
+                remoteLock.lock()
+                var status = remoteDeviceStatus[host] ?? RemoteDeviceStatus()
+                switch result {
+                case .failure(let error): status.error = error.message
+                case .success(let rows):
+                    remoteLLMs[host] = Self.retainingMissingQuotas(rows, previous: remoteLLMs[host] ?? [])
+                    status.lastSuccess = Date().timeIntervalSince1970
+                    status.error = ""
+                }
+                remoteDeviceStatus[host] = status
+                quotaInFlight.remove(host)
+                remoteLock.unlock()
+            }
+        }
+    }
+
+    static func retainingMissingQuotas(_ rows: [DetectedLLMRuntime], previous: [DetectedLLMRuntime]) -> [DetectedLLMRuntime] {
+        var readings = rows
+        for old in previous where !rows.contains(where: { $0.name == old.name }) {
+            readings.append(DetectedLLMRuntime(name: old.name, isRunning: false, tier: "", detail: L("会话数未知", "Sessions unknown")))
+        }
+        return readings.map { row in
+            guard !row.hasQuota, let last = previous.first(where: { $0.name == row.name && $0.hasQuota }) else { return row }
+            var retained = row
+            retained.fiveHour = last.fiveHour; retained.sevenDay = last.sevenDay
+            retained.secondaryFiveHour = last.secondaryFiveHour; retained.secondarySevenDay = last.secondarySevenDay
+            retained.secondaryPoolName = last.secondaryPoolName
+            retained.account = last.account; retained.secondaryAccount = last.secondaryAccount
+            retained.quotaNote = L("未取得新额度，保留上次读数", "Quota missing; showing last reading")
+            return retained
+        }
+    }
+
+    private struct CodexSnapshot {
+        var primary: CodexBucket?
+        var plan: String
+    }
+
+    /// 只展示主桶 "codex"；其他桶（如 codex_bengalfox / Spark）解析出来只为了不被误当主桶，不显示
+    private func codexSnapshot() -> CodexSnapshot {
+        let merged = readLocalCodex()
+        let plan = merged.buckets.values.sorted { $0.captured > $1.captured }.first { !$0.plan.isEmpty }?.plan ?? ""
+        var primary = merged.buckets["codex"]
+
+        // 额度耗尽事件比最后一个百分比快照更新 → 真值就是 100%，重置时刻取错误文案里的时间
+        if let hit = merged.limitHit, hit.at > (primary?.weekly?.capturedAt ?? -1) {
+            let now = Date().timeIntervalSince1970
+            let stillHit = (hit.resetsAt ?? .greatestFiniteMagnitude) > now
+            if stillHit {
+                let win = QuotaWindow(usedPct: 100, resetsAt: hit.resetsAt ?? primary?.weekly?.resetsAt, capturedAt: hit.at,
+                                      windowSeconds: 7 * 86400)
+                if primary == nil || primary?.account != hit.account {
+                    primary = CodexBucket(id: "codex", name: "", fiveHour: nil, weekly: win, plan: plan, captured: hit.at, account: hit.account)
+                } else {
+                    primary?.weekly = win
+                    primary?.captured = hit.at
+                }
+            }
+        }
+        return CodexSnapshot(primary: primary, plan: plan)
+    }
+
+    /// Grok：grok CLI 自己在 ~/.grok/logs/unified.jsonl 记 "billing: fetched credits config"
+    /// （creditUsagePercent = 周额度已用 %，currentPeriod.end = 重置点，subscriptionTier）。文件按 mtime+size 缓存。
+    private var grokQuotaCache: (mtime: TimeInterval, size: UInt64, weekly: QuotaWindow?, tier: String)? = nil
+    private func readGrokQuota() -> (weekly: QuotaWindow?, tier: String) {
+        let path = "\(home)/.grok/logs/unified.jsonl"
+        guard let probe = vgFileStat(path) else { return (nil, "") }
+        let mtime = probe.mtime
+        let size = probe.size
+        if let c = grokQuotaCache, c.mtime == mtime, c.size == size { return (c.weekly, c.tier) }
+
+        var weekly: QuotaWindow? = nil
+        var tier = ""
+        outer: for maxBytes in [512 * 1024, Int.max] {
+            let text = readTail(path, maxBytes: maxBytes)
+            for l in text.components(separatedBy: "\n").reversed() where l.contains("fetched credits config") {
+                guard let data = l.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let ctx = json["ctx"] as? [String: Any],
+                      let cfg = ctx["config"] as? [String: Any],
+                      let pct = clampPct(cfg["creditUsagePercent"] as? NSNumber) else { continue }
+                let period = cfg["currentPeriod"] as? [String: Any]
+                let pStart = parseISO(period?["start"] as? String)
+                let pEnd = parseISO(period?["end"] as? String)
+                // 周期长度用它自己给的起止算；给不出就不推算（windowSeconds 留 0）
+                weekly = QuotaWindow(usedPct: pct, resetsAt: pEnd, capturedAt: parseISO(json["ts"] as? String),
+                                     windowSeconds: (pStart != nil && pEnd != nil) ? max(0, pEnd! - pStart!) : 0)
+                tier = ctx["subscriptionTier"] as? String ?? ""
+                break outer
+            }
+            if text.utf8.count < maxBytes { break }
+        }
+        grokQuotaCache = (mtime, size, weekly, tier)
+        return (weekly, tier)
+    }
+
+    /// Gemini（Antigravity）：agy-hud 写的 quota_cache.json，两个池：gemini / 3p
+    private func readGeminiQuota() -> (native5h: QuotaWindow?, nativeW: QuotaWindow?, tp5h: QuotaWindow?, tpW: QuotaWindow?) {
+        guard let json = readJSON("\(home)/.cache/agy-hud/quota_cache.json"),
+              let pools = json["pools"] as? [String: Any] else { return (nil, nil, nil, nil) }
+        func win(_ pool: Any?, _ key: String) -> QuotaWindow? {
+            guard let p = pool as? [String: Any], let w = p[key] as? [String: Any],
+                  let rf = (w["remaining_fraction"] as? NSNumber)?.doubleValue else { return nil }
+            return QuotaWindow(
+                usedPct: max(0, min(100, Int(round((1.0 - rf) * 100.0)))),
+                resetsAt: (w["reset_at"] as? NSNumber)?.doubleValue,
+                capturedAt: (w["recorded_at"] as? NSNumber)?.doubleValue ?? (json["updated_at"] as? NSNumber)?.doubleValue,
+                windowSeconds: key.contains("five") || key.contains("5h") ? 5 * 3600 : 7 * 86400
+            )
+        }
+        let g = pools["gemini"], tp = pools["3p"]
+        return (win(g, "5h"), win(g, "weekly"), win(tp, "5h"), win(tp, "weekly"))
+    }
+
+    // MARK: 平台汇聚
+
+    // 会话 cwd/启动时长要跑 lsof + ps，太贵，不能跟着每秒的 ticker 跑 → 10s 节流
+    private var sessionCache: [String: (at: TimeInterval, pids: [Int], infos: [SessionInfo])] = [:]
+
+    private func sessionInfos(_ c: SessionCounts, _ kind: CLIKind) -> [SessionInfo] {
+        let pids = (c.pids[kind] ?? []).sorted()
+        guard !pids.isEmpty else { return [] }
+        let key = "\(kind)"
+        let now = Date().timeIntervalSince1970
+        if let cached = sessionCache[key], cached.pids == pids, now - cached.at < 10 {
+            return cached.infos
+        }
+        let cw = cwds(of: pids)
+        let ag = ages(of: pids)
+        let infos = pids.map { SessionInfo(pid: $0, cwd: cw[$0] ?? "?", startedAgo: ag[$0] ?? 0, memMB: c.mem[$0] ?? 0) }
+            .sorted { $0.startedAgo > $1.startedAgo }
+        sessionCache[key] = (now, pids, infos)
+        return infos
+    }
+
+    private func claudeDetail(_ c: SessionCounts) -> PlatformDetail {
+        var d = PlatformDetail()
+        d.sourceFiles = ["~/.claude.json", "~/.claude/claude-usage.json", "~/.claude/projects/*.jsonl"]
+        if let oa = readJSON("\(home)/.claude.json")?["oauthAccount"] as? [String: Any] {
+            if let v = oa["organizationRateLimitTier"] as? String { d.rows.append(("限速档位字段", v)) }
+            if let v = oa["organizationType"] as? String { d.rows.append(("组织类型", v)) }
+            if let v = oa["billingType"] as? String { d.rows.append(("计费方式", v)) }
+            if let v = oa["organizationRole"] as? String { d.rows.append(("角色", v)) }
+            if let b = oa["hasExtraUsageEnabled"] as? Bool { d.rows.append(("额外用量", b ? "已开启" : "未开启")) }
+            if let v = oa["subscriptionCreatedAt"] as? String, let t = Fmt.parseISODate(v) {
+                d.rows.append(("订阅开始", Fmt.dateText(t) + "（\(Int((Date().timeIntervalSince1970 - t) / 86400)) 天前）"))
+            }
+        }
+        d.sessions = sessionInfos(c, .claude)
+        return d
+    }
+
+    private func codexDetail(_ c: SessionCounts, snapshot: CodexSnapshot, buckets: [String: CodexBucket]) -> PlatformDetail {
+        var d = PlatformDetail()
+        d.sourceFiles = ["~/.codex/auth.json", "~/.codex/sessions/*/*.jsonl"]
+        if let auth = readJSON("\(home)/.codex/auth.json"),
+           let idTok = (auth["tokens"] as? [String: Any])?["id_token"] as? String {
+            let segs = idTok.split(separator: ".")
+            if segs.count >= 2 {
+                var payload = String(segs[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+                let rem = payload.count % 4
+                if rem > 0 { payload += String(repeating: "=", count: 4 - rem) }
+                if let data = Data(base64Encoded: payload),
+                   let p = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let a = p["https://api.openai.com/auth"] as? [String: Any] {
+                    if let v = a["chatgpt_plan_type"] as? String { d.rows.append(("套餐字段", v)) }
+                    if let v = a["chatgpt_subscription_active_until"] as? String, let t = Fmt.parseISODate(v) {
+                        let left = Int((t - Date().timeIntervalSince1970) / 86400)
+                        d.rows.append(("订阅有效期至", Fmt.dateText(t) + "（还剩 \(left) 天）"))
                     }
                 }
             }
+            if let mode = auth["auth_mode"] as? String { d.rows.append(("鉴权方式", mode)) }
         }
-        
-        if ProcessInfo.processInfo.environment["XAI_API_KEY"] != nil || ProcessInfo.processInfo.environment["GROK_API_KEY"] != nil {
-            return "API Key"
+        for (id, b) in buckets.sorted(by: { $0.key < $1.key }) where id != "codex" {
+            let label = b.name.isEmpty ? id : b.name
+            if let w = b.weekly { d.extraPools.append(("\(label) 周", w)) }
+            if let w = b.fiveHour { d.extraPools.append(("\(label) 5H", w)) }
         }
-        
-        return "SuperGrok"
+        // Native metadata above already supplies cwd/birth time, avoiding Codex lsof calls.
+        d.codexProcesses = c.codexProcesses
+        // Legacy generic sessions represent CLI processes only, not app-server threads.
+        d.sessions = c.codexProcesses.filter { $0.role != .appServer }.map {
+            SessionInfo(pid: $0.pid, cwd: $0.cwd ?? "?", startedAgo: max(0, Int(Date().timeIntervalSince1970 - $0.startedAt)), memMB: $0.memMB)
+        }
+        return d
     }
 
-    // 多模型自动探针
-    private func detectAllLLMRuntimes(
-        claudeCount: Int,
-        codexCount: Int,
-        agyCount: Int,
-        grokCount: Int,
-        hasOllama: Bool,
-        hasCursor: Bool,
-        hasLMStudio: Bool,
-        tokens: TokenStats
-    ) -> [DetectedLLMRuntime] {
+    private func geminiDetail(_ c: SessionCounts) -> PlatformDetail {
+        var d = PlatformDetail()
+        d.sourceFiles = ["~/.gemini/antigravity-cli/", "~/.cache/agy-hud/quota_cache.json"]
+        if let st = readJSON("\(home)/.gemini/antigravity-cli/settings.json"), let m = st["model"] as? String {
+            d.rows.append(("默认模型", m))
+        }
+        if let tok = readJSON("\(home)/.gemini/antigravity-cli/antigravity-oauth-token"), let m = tok["auth_method"] as? String {
+            d.rows.append(("鉴权方式", m))
+        }
+        d.rows.append(("三方池说明", "只有跑 Claude/GPT 模型时才会刷新；耗尽后无法再刷，只能等重置"))
+        d.sessions = sessionInfos(c, .agy)
+        return d
+    }
+
+    private func grokDetail(_ c: SessionCounts) -> PlatformDetail {
+        var d = PlatformDetail()
+        d.sourceFiles = ["~/.grok/settings_cache.json", "~/.grok/logs/unified.jsonl"]
+        if let cache = readJSON("\(home)/.grok/settings_cache.json"),
+           let payloadStr = cache["payload"] as? String,
+           let pData = payloadStr.data(using: .utf8),
+           let pJson = try? JSONSerialization.jsonObject(with: pData) as? [String: Any],
+           let settings = pJson["settings"] as? [String: Any] {
+            if let v = settings["subscription_tier_display"] as? String { d.rows.append(("订阅档位（服务端原值）", v)) }
+            if let v = pJson["grok_version"] as? String { d.rows.append(("CLI 版本", v)) }
+        }
+        d.rows.append(("额度来源", "grok 自己的 billing 日志，不必产生对话就会刷"))
+        d.sessions = sessionInfos(c, .grok)
+        return d
+    }
+
+    private func detectAllLLMRuntimes(_ c: SessionCounts) -> [DetectedLLMRuntime] {
         var list: [DetectedLLMRuntime] = []
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        
-        // 1. Claude
-        let claudeInstalled = FileManager.default.fileExists(atPath: "\(home)/.claude.json")
-        if claudeCount > 0 || claudeInstalled {
+        let fm = FileManager.default
+
+        // Claude
+        if c.claude > 0 || fm.fileExists(atPath: "\(home)/.claude.json") {
+            let q = readClaudeQuota()
             list.append(DetectedLLMRuntime(
-                name: "Claude",
-                provider: "",
-                isRunning: claudeCount > 0,
-                tier: getClaudeTier(),
-                detail: "\(claudeCount) 会话",
-                fiveHourPct: tokens.fiveHourPct,
-                sevenDayPct: tokens.sevenDayPct,
-                quotaSubtitle: ""
+                name: "Claude", isRunning: c.claude > 0, tier: getClaudeTier(), detail: "\(c.claude) 会话",
+                fiveHour: q.fiveHour, sevenDay: q.sevenDay,
+                secondaryPoolName: q.extraName, secondaryFiveHour: q.extra5h, secondarySevenDay: q.extraW,
+                isFullWidth: !q.extraName.isEmpty,
+                quotaSubtitle: claudeQuotaHint(hasQuota: q.fiveHour != nil || q.sevenDay != nil),
+                platformDetail: claudeDetail(c),
+                account: claudeQuotaIdentity(capturedAt: q.fiveHour?.capturedAt ?? q.sevenDay?.capturedAt)
             ))
         }
-        
-        // 2. Codex
-        let codexInstalled = FileManager.default.fileExists(atPath: "\(home)/.codex/auth.json")
-        if codexCount > 0 || codexInstalled {
+
+        // Codex（只读本机；远程按设备独立展示）
+        if c.codex > 0 || fm.fileExists(atPath: "\(home)/.codex/auth.json") {
+            let q = codexSnapshot()
+            let allBuckets = readLocalCodex().buckets
             list.append(DetectedLLMRuntime(
                 name: "Codex",
-                provider: "",
-                isRunning: codexCount > 0,
-                tier: getCodexTier(),
-                detail: "\(codexCount) 会话",
-                quotaSubtitle: "OpenAI · 会话就绪"
+                isRunning: c.codex > 0,
+                tier: getCodexTier(sessionPlan: q.plan),
+                detail: L("\(c.codex) 进程 · \(c.codexProcesses.reduce(0) { $0 + $1.sessions.count }) 个已关联会话", "\(c.codex) processes · \(c.codexProcesses.reduce(0) { $0 + $1.sessions.count }) linked sessions"),
+                fiveHour: q.primary?.fiveHour, sevenDay: q.primary?.weekly,
+                quotaSubtitle: L("OpenAI · 未采集到本机额度", "OpenAI · Local quota unavailable"),
+                platformDetail: codexDetail(c, snapshot: q, buckets: allBuckets),
+                account: q.primary?.account
             ))
         }
-        
-        // 3. Gemini (支持原生与 Claude/GPT 三方双额度池，独占单行通栏)
-        let geminiInstalled = FileManager.default.fileExists(atPath: "\(home)/.gemini/antigravity-cli/antigravity-oauth-token")
-        if agyCount > 0 || geminiInstalled {
-            let dual = getGeminiDualPools()
-            let hasDual = dual.tpW != nil || dual.tp5h != nil || dual.native5h != nil || dual.nativeW != nil
+
+        // Gemini / Antigravity（双池，独占整行）
+        if c.agy > 0 || fm.fileExists(atPath: "\(home)/.gemini/antigravity-cli") {
+            let q = readGeminiQuota()
+            let hasAny = q.native5h != nil || q.nativeW != nil || q.tp5h != nil || q.tpW != nil
             list.append(DetectedLLMRuntime(
-                name: "Gemini",
-                provider: "",
-                isRunning: agyCount > 0,
-                tier: getGeminiTier(),
-                detail: "\(agyCount) 会话",
-                fiveHourPct: dual.native5h,
-                sevenDayPct: dual.nativeW,
-                secondaryPoolName: "三方 (Claude/GPT)",
-                secondaryFiveHourPct: dual.tp5h,
-                secondarySevenDayPct: dual.tpW,
-                isFullWidth: hasDual,
-                quotaSubtitle: "Agy 运行时 · 会话活跃"
+                name: "Gemini", isRunning: c.agy > 0, tier: getGeminiTier(hasQuota: hasAny), detail: "\(c.agy) 会话",
+                fiveHour: q.native5h, sevenDay: q.nativeW,
+                secondaryPoolName: "三方", secondaryFiveHour: q.tp5h, secondarySevenDay: q.tpW,
+                isFullWidth: hasAny,
+                quotaSubtitle: "Antigravity · 无额度数据 (agy-hud 未刷新)",
+                platformDetail: geminiDetail(c)
             ))
         }
-        
-        // 4. Grok (xAI 订阅)
-        let grokInstalled = FileManager.default.fileExists(atPath: "\(home)/.grok")
-        if grokCount > 0 || grokInstalled {
+
+        // Grok（周额度来自 grok 自己的 billing 日志）
+        if c.grok > 0 || fm.fileExists(atPath: "\(home)/.grok/auth.json") {
+            let q = readGrokQuota()
+            var tier = getGrokTier()
+            if (tier == "已登录" || tier == "未登录"), !q.tier.isEmpty { tier = q.tier }
             list.append(DetectedLLMRuntime(
-                name: "Grok",
-                provider: "",
-                isRunning: grokCount > 0,
-                tier: getGrokTier(),
-                detail: "\(grokCount) 会话",
-                quotaSubtitle: "xAI · grok-4.6 就绪"
+                name: "Grok", isRunning: c.grok > 0, tier: tier, detail: "\(c.grok) 会话",
+                sevenDay: q.weekly,
+                quotaSubtitle: "xAI · 无额度数据 (grok 未跑过)",
+                platformDetail: grokDetail(c)
             ))
         }
-        
-        // 5. Ollama
-        if hasOllama {
-            var ollamaCount = 0
-            var ollamaSub = "端侧运行 · 0 额度消耗"
-            if let url = URL(string: "http://127.0.0.1:11434/api/ps") {
-                var request = URLRequest(url: url)
-                request.timeoutInterval = 0.3
-                let sema = DispatchSemaphore(value: 0)
-                URLSession.shared.dataTask(with: request) { data, _, _ in
-                    if let data = data,
-                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let models = json["models"] as? [[String: Any]], !models.isEmpty {
-                        ollamaCount = models.count
-                        let names = models.compactMap { $0["name"] as? String }.joined(separator: ", ")
-                        ollamaSub = "模型: \(names)"
-                    }
-                    sema.signal()
-                }.resume()
-                _ = sema.wait(timeout: .now() + 0.3)
-            }
+
+        // Ollama（探测结果缓存 10s，避免 ticker 每秒阻塞）
+        if c.ollama {
+            let o = probeOllama()
             list.append(DetectedLLMRuntime(
-                name: "Ollama",
-                provider: "",
-                isRunning: ollamaCount > 0,
-                tier: "本地",
-                detail: "\(ollamaCount) 会话",
-                quotaSubtitle: ollamaSub
+                name: "Ollama", isRunning: o.count > 0, tier: "本地", detail: "\(o.count) 模型", quotaSubtitle: o.sub
             ))
         }
-        
-        // 6. Cursor
-        if hasCursor {
-            list.append(DetectedLLMRuntime(
-                name: "Cursor",
-                provider: "",
-                isRunning: true,
-                tier: "Pro",
-                detail: "1 会话",
-                quotaSubtitle: "高速池 500次/月"
-            ))
+
+        if c.cursor {
+            list.append(DetectedLLMRuntime(name: "Cursor", isRunning: true, tier: "", detail: "运行中", quotaSubtitle: "IDE 进程在线 · 本地无档位/额度数据"))
         }
-        
-        // 7. LM Studio
-        if hasLMStudio {
-            list.append(DetectedLLMRuntime(
-                name: "LM Studio",
-                provider: "",
-                isRunning: true,
-                tier: "本地",
-                detail: "1 会话",
-                quotaSubtitle: "端侧运行 · 0 额度消耗"
-            ))
+
+        if c.lmStudio {
+            list.append(DetectedLLMRuntime(name: "LM Studio", isRunning: true, tier: "本地", detail: "运行中", quotaSubtitle: "端侧运行 · 0 额度消耗"))
         }
-        
+
         return list
     }
-    
-    // 毫秒级极速探查活跃 LLM 会话状态 (用于菜单打开时的动态实时更新)
-    public func scanActiveLLMs() -> [DetectedLLMRuntime] {
-        let psOut = execute("ps -axo pid,ppid,command")
-        let lines = psOut.components(separatedBy: "\n").dropFirst()
-        
-        var claudeCount = 0
-        var codexCount = 0
-        var agyCount = 0
-        var grokCount = 0
-        var hasOllama = false
-        var hasCursor = false
-        var hasLMStudio = false
-        
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty { continue }
-            let parts = trimmed.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-            if parts.count < 3 { continue }
-            guard let ppid = Int(parts[1]) else { continue }
-            let cmd = String(parts[2])
-            
-            let lowerCmd = cmd.lowercased()
-            if lowerCmd.contains("cursor.app") || (lowerCmd.contains("/cursor") && !lowerCmd.contains("cursoruiviewservice")) {
-                hasCursor = true
-            }
-            if lowerCmd.contains("ollama") {
-                hasOllama = true
-            }
-            if lowerCmd.contains("lmstudio") || lowerCmd.contains("lm studio") {
-                hasLMStudio = true
-            }
-            
-            if ppid != 1 {
-                if ProcessScanner.isClaudeCLISession(cmd: cmd) {
-                    claudeCount += 1
-                } else if ProcessScanner.isCodexCLISession(cmd: cmd) {
-                    codexCount += 1
-                } else if ProcessScanner.isAgyCLISession(cmd: cmd) {
-                    agyCount += 1
-                } else if ProcessScanner.isGrokCLISession(cmd: cmd) {
-                    grokCount += 1
+
+    private func probeOllama() -> (count: Int, sub: String) {
+        let now = Date().timeIntervalSince1970
+        if let c = ollamaCache, now - c.at < 10 { return (c.count, c.sub) }
+        // 结果放独立加锁的盒子：超时后迟到的回调只写盒子，不与扫描线程的读竞争
+        final class Box { let lock = NSLock(); var count = 0; var sub = "端侧运行 · 无已加载模型" }
+        let box = Box()
+        if let url = URL(string: "http://127.0.0.1:11434/api/ps") {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 0.3
+            let sema = DispatchSemaphore(value: 0)
+            URLSession.shared.dataTask(with: request) { data, _, _ in
+                if let data = data,
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let models = json["models"] as? [[String: Any]], !models.isEmpty {
+                    box.lock.lock()
+                    box.count = models.count
+                    box.sub = "已加载: " + models.compactMap { $0["name"] as? String }.joined(separator: ", ")
+                    box.lock.unlock()
                 }
-            }
+                sema.signal()
+            }.resume()
+            _ = sema.wait(timeout: .now() + 0.3)
         }
-        
-        if grokCount == 0 {
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            let grokSessionsPath = "\(home)/.grok/active_sessions.json"
-            if let data = try? Data(contentsOf: URL(fileURLWithPath: grokSessionsPath)),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
-                for s in json {
-                    if let pid = s["pid"] as? Int, kill(pid_t(pid), 0) == 0 {
-                        grokCount += 1
-                    }
-                }
-            }
-        }
-        
-        return detectAllLLMRuntimes(
-            claudeCount: claudeCount,
-            codexCount: codexCount,
-            agyCount: agyCount,
-            grokCount: grokCount,
-            hasOllama: hasOllama,
-            hasCursor: hasCursor,
-            hasLMStudio: hasLMStudio,
-            tokens: cachedTokenStats
-        )
-    }
-    
-    // 从最近修改的会话中提取多轮交互记录 (最多提取 maxCount 条)
-    private func parseRecentInteractions(recentFiles: [(path: String, mtime: TimeInterval)], maxCount: Int = 3, now: TimeInterval) -> [InteractionRecord] {
-        var records: [InteractionRecord] = []
-        let isoFormatter = ISO8601DateFormatter()
-        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let isoFallback = ISO8601DateFormatter()
-        isoFallback.formatOptions = [.withInternetDateTime]
-        
-        for file in recentFiles.prefix(5) {
-            guard let content = try? String(contentsOfFile: file.path, encoding: .utf8) else { continue }
-            let lines = content.components(separatedBy: "\n")
-            for line in lines.reversed() {
-                if line.contains("\"type\":\"assistant\"") && line.contains("\"usage\":") {
-                    guard let data = line.data(using: .utf8),
-                          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          let msg = json["message"] as? [String: Any],
-                          let usage = msg["usage"] as? [String: Any] else { continue }
-                    
-                    let uuid = json["uuid"] as? String ?? UUID().uuidString
-                    if records.contains(where: { $0.id == uuid }) { continue }
-                    
-                    let model = msg["model"] as? String ?? "claude"
-                    let inp = usage["input_tokens"] as? Int ?? 0
-                    let cRead = usage["cache_read_input_tokens"] as? Int ?? 0
-                    let cCreate = usage["cache_creation_input_tokens"] as? Int ?? 0
-                    let out = usage["output_tokens"] as? Int ?? 0
-                    let details = usage["output_tokens_details"] as? [String: Any]
-                    let thinking = details?["thinking_tokens"] as? Int ?? 0
-                    let totalCtx = inp + cRead + cCreate
-                    let hitRate = totalCtx > 0 ? (Double(cRead) / Double(totalCtx)) * 100.0 : 0.0
-                    
-                    var ts: TimeInterval = 0
-                    if let tsStr = json["timestamp"] as? String {
-                        if let d = isoFormatter.date(from: tsStr) ?? isoFallback.date(from: tsStr) {
-                            ts = d.timeIntervalSince1970
-                        }
-                    }
-                    if ts == 0 {
-                        ts = file.mtime
-                    }
-                    
-                    records.append(InteractionRecord(
-                        id: uuid,
-                        model: model,
-                        timestamp: ts,
-                        secondsAgo: max(0, Int(now - ts)),
-                        contextTokens: totalCtx,
-                        outputTokens: out,
-                        thinkingTokens: thinking,
-                        cacheHitRate: hitRate
-                    ))
-                    
-                    if records.count >= maxCount {
-                        break
-                    }
-                }
-            }
-            if records.count >= maxCount {
-                break
-            }
-        }
-        
-        records.sort { $0.timestamp > $1.timestamp }
-        return Array(records.prefix(maxCount))
+        box.lock.lock()
+        let result = (count: box.count, sub: box.sub)
+        box.lock.unlock()
+        ollamaCache = (result.count, result.sub, now)
+        return result
     }
 
-    private func scanTokens() -> TokenStats {
-        let now = Date().timeIntervalSince1970
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let projectsDir = "\(home)/.claude/projects"
-        guard FileManager.default.fileExists(atPath: projectsDir) else { return cachedTokenStats }
-        
-        let window5h = now - 5.0 * 3600.0
-        let window24h = now - 24.0 * 3600.0
-        
-        let fileManager = FileManager.default
-        guard let enumerator = fileManager.enumerator(atPath: projectsDir) else { return cachedTokenStats }
-        
-        var recentFiles: [(path: String, mtime: TimeInterval)] = []
-        while let element = enumerator.nextObject() as? String {
-            if element.hasSuffix(".jsonl") {
-                let fullPath = "\(projectsDir)/\(element)"
-                if let attrs = try? fileManager.attributesOfItem(atPath: fullPath),
-                   let modDate = attrs[.modificationDate] as? Date {
-                    let mtime = modDate.timeIntervalSince1970
-                    if mtime > window24h {
-                        recentFiles.append((fullPath, mtime))
-                    }
+    // MARK: Token 遥测（增量解析，requestId 去重）
+
+    private func parseAssistantLine(_ line: Substring) -> InteractionRecord? {
+        guard line.contains("\"type\":\"assistant\""), line.contains("\"usage\":"),
+              let data = line.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let msg = json["message"] as? [String: Any],
+              let usage = msg["usage"] as? [String: Any] else { return nil }
+        let model = msg["model"] as? String ?? ""
+        if model.contains("synthetic") || json["isApiErrorMessage"] as? Bool == true { return nil }
+        let id = (json["requestId"] as? String) ?? (msg["id"] as? String) ?? (json["uuid"] as? String) ?? UUID().uuidString
+        let inp = usage["input_tokens"] as? Int ?? 0
+        let cRead = usage["cache_read_input_tokens"] as? Int ?? 0
+        let cCreate = usage["cache_creation_input_tokens"] as? Int ?? 0
+        let out = usage["output_tokens"] as? Int ?? 0
+        let thinking = (usage["output_tokens_details"] as? [String: Any])?["thinking_tokens"] as? Int ?? 0
+        return InteractionRecord(
+            id: id, model: model, timestamp: parseISO(json["timestamp"] as? String) ?? 0,
+            contextTokens: inp + cRead + cCreate, cacheReadTokens: cRead, outputTokens: out, thinkingTokens: thinking
+        )
+    }
+
+    /// jsonl 是 append-only：只解析上次 offset 之后新增的完整行；文件变小则整体重解析
+    private func refreshFileState(path: String, mtime: TimeInterval, size: UInt64) -> FileParseState {
+        var state = fileStates[path] ?? FileParseState()
+        if state.mtime == mtime && state.size == size { return state }
+
+        guard let fh = FileHandle(forReadingAtPath: path) else { return state }
+        defer { try? fh.close() }
+        // 变小、或前 256 字节指纹变了 = 被截断重写 / 替换 → 整体重解析（正常 append 两者都不变）
+        let head = (try? fh.read(upToCount: 256)) ?? Data()
+        if size < state.size || head != state.head { state = FileParseState() }
+        state.head = head
+        do { try fh.seek(toOffset: state.parsedOffset) } catch { return state }
+        let data = fh.readDataToEndOfFile()
+
+        if let lastNL = data.lastIndex(of: 0x0A) {
+            let chunk = data[data.startIndex...lastNL]
+            let text = String(decoding: chunk, as: UTF8.self)   // lossy：坏字节只毁一行，不丢整块
+            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                if var rec = parseAssistantLine(line) {
+                    if rec.timestamp == 0 { rec.timestamp = mtime }
+                    // 同 requestId 流式分块会写多行，取 token 最多的那条（与历史统计口径一致）
+                    if let old = state.turns[rec.id], old.contextTokens + old.outputTokens > rec.contextTokens + rec.outputTokens { continue }
+                    state.turns[rec.id] = rec
                 }
             }
+            state.parsedOffset += UInt64(chunk.count)
         }
-        recentFiles.sort { $0.mtime > $1.mtime }
-        
-        var stats = TokenStats()
-        
-        // A. 实时提取：最新会话的多轮交互遥测 (最多提取 3 轮)
-        let interactions = parseRecentInteractions(recentFiles: recentFiles, maxCount: 3, now: now)
-        stats.recentInteractions = interactions
-        if let first = interactions.first {
-            stats.latestTimestamp = first.timestamp
-            stats.latestSecondsAgo = first.secondsAgo
-            stats.latestModel = first.model
-            stats.latestContext = first.contextTokens
-            stats.latestOutput = first.outputTokens
-            stats.latestThinking = first.thinkingTokens
-            stats.latestCacheHitRate = first.cacheHitRate
+        state.mtime = mtime
+        state.size = size
+        fileStates[path] = state
+        return state
+    }
+
+    struct LogFileStamp: Equatable {
+        let path: String
+        let mtime: TimeInterval
+        let size: UInt64
+        static func read(_ path: String) -> LogFileStamp? {
+            guard let probe = vgFileStat(path) else { return nil }
+            return LogFileStamp(path: path, mtime: probe.mtime, size: probe.size)
         }
-        
-        // B. 累计统计：每 45 秒刷新一次全量
-        if now - lastCumulativeScanTime > 45.0 || cachedTokenStats.todayContext == 0 {
-            lastCumulativeScanTime = now
-            for file in recentFiles {
-                guard let content = try? String(contentsOfFile: file.path, encoding: .utf8) else { continue }
-                let lines = content.components(separatedBy: "\n")
-                let is5h = file.mtime > window5h
-                
-                for line in lines {
-                    if line.contains("\"type\":\"assistant\"") && line.contains("\"usage\":") {
-                        if let data = line.data(using: .utf8),
-                           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                           let msg = json["message"] as? [String: Any],
-                           let usage = msg["usage"] as? [String: Any] {
-                            let inp = Int64(usage["input_tokens"] as? Int ?? 0)
-                            let cRead = Int64(usage["cache_read_input_tokens"] as? Int ?? 0)
-                            let cCreate = Int64(usage["cache_creation_input_tokens"] as? Int ?? 0)
-                            let out = Int64(usage["output_tokens"] as? Int ?? 0)
-                            let details = usage["output_tokens_details"] as? [String: Any]
-                            let thinking = Int64(details?["thinking_tokens"] as? Int ?? 0)
-                            let ctx = inp + cRead + cCreate
-                            
-                            stats.todayTurns += 1
-                            stats.todayContext += ctx
-                            stats.todayCacheRead += cRead
-                            stats.todayOutput += out
-                            stats.todayThinking += thinking
-                            
-                            if is5h {
-                                stats.turns5h += 1
-                                stats.context5h += ctx
-                                stats.output5h += out
-                            }
+    }
+
+    /// Directory mtimes discover additions/removals; periodic sweeps rediscover old files that become active.
+    /// Between sweeps, stat only files still in the 24h window, not every historical transcript.
+    struct RecentLogIndex {
+        private var listedAt: TimeInterval?
+        private var directories: [String: TimeInterval] = [:]
+        private var files: [LogFileStamp] = []
+        private(set) var enumerations = 0
+
+        mutating func snapshots(roots: [String], horizon: TimeInterval, now: TimeInterval) -> [LogFileStamp] {
+            let fm = FileManager.default
+            func directoryTime(_ path: String) -> TimeInterval {
+                vgFileStat(path)?.mtime ?? -1
+            }
+            let expired = listedAt.map { now < $0 || now - $0 >= 120 } ?? true
+            if expired || directories.contains(where: { directoryTime($0.key) != $0.value }) {
+                enumerations += 1
+                directories = [:]; files = []
+                for root in roots {
+                    directories[root] = directoryTime(root)
+                    guard let en = fm.enumerator(at: URL(fileURLWithPath: root),
+                                                 includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey]) else { continue }
+                    for case let url as URL in en {
+                        guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey]) else { continue }
+                        if values.isDirectory == true {
+                            // Use the same timestamp representation as invalidation checks;
+                            // Foundation Date can round one ULP away from stat's Unix time.
+                            directories[url.path] = directoryTime(url.path)
+                        } else if url.pathExtension == "jsonl", let stamp = LogFileStamp.read(url.path),
+                                  stamp.mtime > horizon {
+                            files.append(stamp)
                         }
                     }
                 }
+                listedAt = now
+            } else {
+                files = files.compactMap { old in
+                    guard old.mtime > horizon, let fresh = LogFileStamp.read(old.path), fresh.mtime > horizon else { return nil }
+                    return fresh
+                }
             }
-            cachedTokenStats.turns5h = stats.turns5h
-            cachedTokenStats.context5h = stats.context5h
-            cachedTokenStats.output5h = stats.output5h
-            cachedTokenStats.todayTurns = stats.todayTurns
-            cachedTokenStats.todayContext = stats.todayContext
-            cachedTokenStats.todayCacheRead = stats.todayCacheRead
-            cachedTokenStats.todayOutput = stats.todayOutput
-            cachedTokenStats.todayThinking = stats.todayThinking
-        } else {
-            stats.turns5h = cachedTokenStats.turns5h
-            stats.context5h = cachedTokenStats.context5h
-            stats.output5h = cachedTokenStats.output5h
-            stats.todayTurns = cachedTokenStats.todayTurns
-            stats.todayContext = cachedTokenStats.todayContext
-            stats.todayCacheRead = cachedTokenStats.todayCacheRead
-            stats.todayOutput = cachedTokenStats.todayOutput
-            stats.todayThinking = cachedTokenStats.todayThinking
+            return files.sorted { $0.path < $1.path }
         }
-        
-        // C. 读取服务端下发的真实订阅配额 (Claude Max/Pro 5h与7d配额)
-        let usagePath = "\(home)/.claude/claude-usage.json"
-        if let data = try? Data(contentsOf: URL(fileURLWithPath: usagePath)),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let fh = json["five_hour"] as? [String: Any],
-               let pct = fh["used_percentage"] as? Int {
-                stats.fiveHourPct = pct
-            }
-            if let sd = json["seven_day"] as? [String: Any],
-               let pct = sd["used_percentage"] as? Int {
-                stats.sevenDayPct = pct
-            }
-        }
-        
-        return stats
     }
-    
-    // 毫秒级极速探查最新一轮会话遥测 (用于菜单打开时的动态实时监测)
-    public func scanLatestInteraction() -> TokenStats {
-        var stats = cachedTokenStats
+    private var claudeLogIndex = RecentLogIndex()
+    private var tokenCache: (day: TimeInterval, claude: [LogFileStamp], codex: [LogFileStamp], stats: TokenStats)?
+    private var cliCache: (day: TimeInterval, claude: TokenStats, files: [LogFileStamp], usage: [CLIUsage])?
+
+    public func scanTokens() -> TokenStats {
+        lock.lock(); defer { lock.unlock() }
         let now = Date().timeIntervalSince1970
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let projectsDir = "\(home)/.claude/projects"
-        guard FileManager.default.fileExists(atPath: projectsDir) else { return stats }
-        
-        let fileManager = FileManager.default
-        guard let enumerator = fileManager.enumerator(atPath: projectsDir) else { return stats }
-        
-        var recentFiles: [(path: String, mtime: TimeInterval)] = []
-        let window1h = now - 3600.0
-        
-        while let element = enumerator.nextObject() as? String {
-            if element.hasSuffix(".jsonl") {
-                let fullPath = "\(projectsDir)/\(element)"
-                if let attrs = try? fileManager.attributesOfItem(atPath: fullPath),
-                   let modDate = attrs[.modificationDate] as? Date {
-                    let mtime = modDate.timeIntervalSince1970
-                    if mtime > window1h {
-                        recentFiles.append((fullPath, mtime))
+        let horizon = now - 24.0 * 3600.0
+        var seen = Set<String>()
+        var byId: [String: InteractionRecord] = [:]   // 跨文件再去重（--fork-session 会把历史复制进新文件）
+        var idPath: [String: String] = [:]            // 这轮最终算在哪个文件上 → 用来归因到项目目录
+        let startOfToday = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        let files = claudeLogIndex.snapshots(roots: ["\(home)/.claude/projects", "\(home)/.config/claude/projects"],
+                                              horizon: horizon, now: now)
+        let codexFiles = codexHotFiles(startOfToday: startOfToday).compactMap(LogFileStamp.read)
+        if let cache = tokenCache, cache.day == startOfToday, cache.claude == files, cache.codex == codexFiles {
+            return cache.stats
+        }
+        for file in files {
+            let path = file.path
+            seen.insert(path)
+            for (id, rec) in refreshFileState(path: path, mtime: file.mtime, size: file.size).turns {
+                if let old = byId[id], old.contextTokens + old.outputTokens >= rec.contextTokens + rec.outputTokens { continue }
+                byId[id] = rec
+                idPath[id] = path
+            }
+        }
+        fileStates = fileStates.filter { seen.contains($0.key) }
+        let all = byId.values
+
+        var s = TokenStats()
+        for t in all where t.timestamp >= startOfToday {
+            s.todayTurns += 1
+            s.todayContext += Int64(t.contextTokens)
+            s.todayCacheRead += Int64(t.cacheReadTokens)
+            s.todayOutput += Int64(t.outputTokens)
+            s.todayThinking += Int64(t.thinkingTokens)
+        }
+        s.recentInteractions = Array(all.sorted { $0.timestamp > $1.timestamp }.prefix(3))
+
+        // 按项目归因：Claude 这边用每轮所属文件的 cwd
+        var byProject: [String: ProjectUsage] = [:]
+        for (id, t) in byId where t.timestamp >= startOfToday {
+            guard let path = idPath[id], let cwd = sessionCwd(of: path) else { continue }
+            var p = byProject[cwd] ?? ProjectUsage(path: cwd)
+            p.turns += 1
+            p.ctx += Int64(t.contextTokens)
+            p.out += Int64(t.outputTokens)
+            p.think += Int64(t.thinkingTokens)
+            if !p.clis.contains("Claude") { p.clis.append("Claude") }
+            byProject[cwd] = p
+        }
+        mergeCodexProjects(into: &byProject, startOfToday: startOfToday)
+        s.todayByProject = byProject.values.sorted { $0.ctx > $1.ctx }
+        tokenCache = (startOfToday, files, codexFiles, s)
+        return s
+    }
+
+    /// Codex 的今日用量按会话文件的 cwd 归并。口径与 codexUsageToday 一致（逐请求、按时间戳算今天）。
+    private func mergeCodexProjects(into byProject: inout [String: ProjectUsage], startOfToday: TimeInterval) {
+        for path in codexHotFiles(startOfToday: startOfToday) {
+            guard let cwd = sessionCwd(of: path), let u = codexFileUsage(path: path), u.requests > 0 else { continue }
+            var p = byProject[cwd] ?? ProjectUsage(path: cwd)
+            p.turns += u.requests
+            p.ctx += u.ctx
+            p.out += u.out
+            p.think += u.think
+            if !p.clis.contains("Codex") { p.clis.append("Codex") }
+            byProject[cwd] = p
+        }
+    }
+
+    // MARK: 各 CLI 今日用量
+
+    /// 单个 Codex 会话文件「今天」的增量解析状态。跨零点整体重来一次（只读今天的请求）。
+    private struct CodexTodayState {
+        var day = ""
+        var offset: UInt64 = 0
+        var model = "?"
+        var tier: String? = nil
+        var previousTotal: [String: Int64]? = nil
+        var hasUsageRecords = false
+        var usage = CLIUsage(name: "Codex")
+    }
+    private var codexToday: [String: CodexTodayState] = [:]
+    private var codexFileList: (at: TimeInterval, files: [(path: String, mtime: TimeInterval)]) = (0, [])
+
+    /// 今天动过的 Codex 会话文件。按「开始日期」分目录，老会话今天还在跑也要算上 → 全量列目录，60 秒缓存一次。
+    private func codexHotFiles(startOfToday: TimeInterval) -> [String] {
+        let now = Date().timeIntervalSince1970
+        if now - codexFileList.at > 60 {
+            var files: [(String, TimeInterval)] = []
+            let root = URL(fileURLWithPath: "\(home)/.codex/sessions")
+            if let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) {
+                for case let url as URL in en where url.pathExtension == "jsonl" {
+                    let mt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate?.timeIntervalSince1970 ?? 0
+                    files.append((url.path, mt))
+                }
+            }
+            codexFileList = (now, files)
+        }
+        // 60 秒内新建的会话由下一次列目录补上；已知文件每次重新取 mtime（只 stat 近两天动过的）
+        return codexFileList.files.compactMap { item in
+            guard item.mtime >= startOfToday - 86400 else { return nil }
+            guard let probe = vgFileStat(item.path) else { return nil }
+            return probe.mtime >= startOfToday ? item.path : nil
+        }
+    }
+
+    /// Codex 今天：逐请求累加时间戳落在今天的用量（token_usage_record 优先，旧版用 token_count 的 last_token_usage）。
+    /// 旧实现取每个会话的累计值，跨零点的长会话会把前几天也算进今天。
+    private func codexUsageToday(startOfToday: TimeInterval) -> CLIUsage {
+        var u = CLIUsage(name: "Codex")
+        let hot = codexHotFiles(startOfToday: startOfToday)
+        for path in hot {
+            guard let one = codexFileUsage(path: path) else { continue }
+            u.ctx += one.ctx
+            u.cacheRead += one.cacheRead
+            u.out += one.out
+            u.think += one.think
+            u.requests += one.requests
+        }
+        let keep = Set(hot)
+        codexToday = codexToday.filter { keep.contains($0.key) }
+        if !u.hasTokens { u.note = "今日无调用" }
+        return u
+    }
+
+    /// 从文件尾部按 4MB 往回跳，找到第一个时间戳早于 `start` 的行首；rollout 每行以 {"timestamp":"…"} 开头且按时间追加。
+    static func codexSeekToDay(_ fh: FileHandle, size: UInt64, start: TimeInterval) -> UInt64 {
+        let step: UInt64 = 4 << 20
+        var pos = size
+        while pos > 0 {
+            let from = pos > step ? pos - step : 0
+            guard (try? fh.seek(toOffset: from)) != nil, let data = try? fh.read(upToCount: 4096), !data.isEmpty else { return 0 }
+            // 跳过半行，取下一行的时间戳
+            var lineStart = data.startIndex
+            if from > 0 { guard let nl = data.firstIndex(of: 0x0A) else { pos = from; continue }; lineStart = data.index(after: nl) }
+            let head = String(decoding: data[lineStart...].prefix(80), as: UTF8.self)
+            if let r = head.range(of: #"\d{4}-\d{2}-\d{2}T[0-9:.]+Z"#, options: .regularExpression),
+               let t = Fmt.parseISODate(String(head[r])), t < start {
+                return from + UInt64(data.distance(from: data.startIndex, to: lineStart))
+            }
+            if from == 0 { return 0 }
+            pos = from
+        }
+        return 0
+    }
+
+    /// 单个 Codex 会话文件今天的用量（增量读，只解析新追加的完整行）。按 CLI 汇总与按项目归因共用这一份。
+    private func codexFileUsage(path: String, mtime: TimeInterval? = nil) -> CLIUsage? {
+        let startOfToday = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        let day = UsageHistory.dayKey(timestamp: startOfToday + 1)
+        guard let probe = vgFileStat(path) else { return nil }
+        let size = probe.size
+        var st = codexToday[path] ?? CodexTodayState()
+        var fresh = false
+        if st.day != day || size < st.offset { st = CodexTodayState(); st.day = day; fresh = true }
+        guard size > st.offset, let fh = FileHandle(forReadingAtPath: path) else { codexToday[path] = st; return st.usage }
+        defer { try? fh.close() }
+        // 第一次读（或跨零点）：长会话文件动辄几百 MB，从尾部往回跳到「今天之前」的那一行再开始，别整文件扫
+        if fresh, size > 8 << 20 { st.offset = Self.codexSeekToDay(fh, size: size, start: startOfToday) }
+        do { try fh.seek(toOffset: st.offset) } catch { return st.usage }
+        let data = fh.readDataToEndOfFile()
+        guard let lastNL = data.lastIndex(of: 0x0A) else { codexToday[path] = st; return st.usage }
+        let chunk = data[data.startIndex...lastNL]
+        let markers = ["\"token_count\"", "\"turn_context\"", "\"token_usage_record\"", "\"thread_settings_applied\""].map { Data($0.utf8) }
+        for line in chunk.split(separator: 0x0A) {
+            guard markers.contains(where: { line.range(of: $0) != nil }),
+                  let j = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
+                  let payload = j["payload"] as? [String: Any] else { continue }
+            let type = j["type"] as? String ?? ""
+            let ts = parseISO(j["timestamp"] as? String) ?? 0
+            func add(_ m: UsageHistory.ModelTotals) {
+                st.usage.ctx += m.ctx; st.usage.cacheRead += m.cacheRead
+                st.usage.out += m.out; st.usage.think += m.think; st.usage.requests += 1
+            }
+            if type == "turn_context" {
+                if let model = payload["model"] as? String, !model.isEmpty { st.model = model }
+            } else if type == "token_usage_record" {
+                if !st.hasUsageRecords { st.hasUsageRecords = true; st.usage = CLIUsage(name: "Codex") }
+                guard ts >= startOfToday, let fields = UsageHistory.tokenFields(payload["usage"]) else { continue }
+                add(UsageHistory.codexLastTokenUsage(fields))
+            } else if type == "event_msg", payload["type"] as? String == "token_count", let info = payload["info"] as? [String: Any] {
+                guard let parsed = UsageHistory.codexUsage(info: info, previous: &st.previousTotal),
+                      !st.hasUsageRecords, ts >= startOfToday else { continue }
+                add(parsed.usage)
+            }
+        }
+        st.offset += UInt64(chunk.count)
+        codexToday[path] = st
+        return st.usage
+    }
+
+    /// Grok：`signals.json` 只有 `turnCount` 与当前上下文占用，没有累计 token
+    private func grokUsageToday(startOfToday: TimeInterval) -> CLIUsage {
+        var u = CLIUsage(name: "Grok")
+        let fm = FileManager.default
+        let root = "\(home)/.grok/sessions"
+        guard let dirs = try? fm.contentsOfDirectory(atPath: root) else {
+            u.note = "本地无 token 统计"
+            return u
+        }
+        for d in dirs {
+            guard let subs = try? fm.contentsOfDirectory(atPath: "\(root)/\(d)") else { continue }
+            for sub in subs {
+                let path = "\(root)/\(d)/\(sub)/signals.json"
+                guard let probe = vgFileStat(path),
+                      probe.mtime >= startOfToday,
+                      let j = readJSON(path) else { continue }
+                u.turns += (j["turnCount"] as? NSNumber)?.intValue ?? 0
+            }
+        }
+        u.note = u.turns > 0 ? "本地无 token 统计，仅轮次" : "今日无调用"
+        return u
+    }
+
+    public func scanCLIUsage(claude: TokenStats) -> [CLIUsage] {
+        lock.lock(); defer { lock.unlock() }
+        let startOfToday = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        let fm = FileManager.default
+        var inputs = codexHotFiles(startOfToday: startOfToday).compactMap(LogFileStamp.read)
+        let grok = "\(home)/.grok/sessions"
+        for dir in (try? fm.contentsOfDirectory(atPath: grok)) ?? [] {
+            for sub in (try? fm.contentsOfDirectory(atPath: "\(grok)/\(dir)")) ?? [] {
+                if let stamp = LogFileStamp.read("\(grok)/\(dir)/\(sub)/signals.json") { inputs.append(stamp) }
+            }
+        }
+        inputs.sort { $0.path < $1.path }
+        if let cache = cliCache, cache.day == startOfToday, cache.claude == claude, cache.files == inputs { return cache.usage }
+        var claudeRow = CLIUsage(name: "Claude Code")
+        claudeRow.requests = claude.todayTurns
+        claudeRow.ctx = claude.todayContext
+        claudeRow.cacheRead = claude.todayCacheRead
+        claudeRow.out = claude.todayOutput
+        claudeRow.think = claude.todayThinking
+        if !claudeRow.hasTokens { claudeRow.note = "今日无调用" }
+
+        var gemini = CLIUsage(name: "Gemini")
+        gemini.note = "本地无 token 统计（额度见上）"      // conversations 是 SQLite，无 token 字段
+
+        let rows = [claudeRow, codexUsageToday(startOfToday: startOfToday), grokUsageToday(startOfToday: startOfToday), gemini]
+        cliCache = (startOfToday, claude, inputs, rows)
+        return rows
+    }
+
+    // MARK: API Key 调用（读记账代理写的 api-calls.jsonl / api-quota.json）
+
+    private struct APICall {
+        let ts: TimeInterval
+        let host: String
+        let provider: String
+        let model: String
+        let ctx: Int64
+        let cacheRead: Int64
+        let cacheWrite: Int64
+        let out: Int64
+        let think: Int64
+        let status: Int
+        let ms: Int
+        let key: String
+        let rl: [String: String]
+    }
+
+    /// 价目表：`~/.config/vibedeck/prices.json`，单位 = 每百万 token。
+    /// ```
+    /// { "_asof": "2026-09-18", "_currency": "CNY",
+    ///   "glm-4.7": { "in": 0.6, "cache_read": 0.11, "cache_write": 0.6, "out": 2.2 } }
+    /// ```
+    /// 没这文件就不估花费 —— 价格会变，编一个假的比不显示更糟。模型名取「最长前缀命中」。
+    public struct PriceTable {
+        /// 一套单价（峰时或闲时各一套）。
+        public struct Rate {
+            public var input = 0.0, cacheRead = 0.0, cacheWrite = 0.0, output = 0.0
+            var isEmpty: Bool { input == 0 && output == 0 && cacheRead == 0 && cacheWrite == 0 }
+        }
+        public struct Row {
+            public var peak: Rate
+            /// 配了闲时价就按记录时间二选一（DeepSeek 那种峰谷定价）；没配则恒用 peak。
+            public var offpeak: Rate?
+            public var currency = ""
+            /// 自定义单价的 Fast 倍率；未配置时保留原来的最终价。
+            public var fastMultiplier = 1.0
+        }
+        /// 峰时窗口：表里配的时区 + 若干 HH:MM-HH:MM 段（分钟数）。没配就视为全天同价。
+        public struct PeakSpec {
+            public var timeZone: TimeZone = .current
+            public var windows: [(start: Int, end: Int)] = []
+            /// Calendar weekday：1=周日，2=周一…7=周六；空集合沿用每日窗口。
+            public var weekdays: Set<Int> = []
+            public var excludedDates: Set<String> = []
+            func isPeak(_ date: Date) -> Bool {
+                guard !windows.isEmpty else { return true }
+                var cal = Calendar(identifier: .gregorian)
+                cal.timeZone = timeZone
+                let parts = cal.dateComponents([.year, .month, .day, .weekday, .hour, .minute], from: date)
+                if !weekdays.isEmpty, !weekdays.contains(parts.weekday ?? 0) { return false }
+                let key = String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
+                if excludedDates.contains(key) { return false }
+                let minutes = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
+                return windows.contains { minutes >= $0.start && minutes < $0.end }
+            }
+        }
+        public var rows: [String: Row] = [:]
+        public var peak = PeakSpec()
+        public var currency: String = ""
+        public var asOf: String = ""
+        public var isEmpty: Bool { rows.isEmpty }
+
+        public init() {}
+        public init(json: [String: Any]) {
+            currency = (json["_currency"] as? String) ?? "USD"
+            asOf = (json["_asof"] as? String) ?? ""
+            if let p = json["_peak"] as? [String: Any] {
+                if let tzid = p["tz"] as? String, let tz = TimeZone(identifier: tzid) { peak.timeZone = tz }
+                peak.weekdays = Set(((p["weekdays"] as? [Int]) ?? []).filter { (1...7).contains($0) })
+                peak.excludedDates = Set(((p["excluded_dates"] as? [String]) ?? []).filter {
+                    $0.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
+                })
+                for text in (p["windows"] as? [String]) ?? [] {
+                    let ends = text.split(separator: "-")
+                    if ends.count == 2, let start = Self.minutes(String(ends[0])), let end = Self.minutes(String(ends[1])) {
+                        peak.windows.append((start, end))
                     }
                 }
             }
+            for (k, v) in json where !k.hasPrefix("_") {
+                guard let d = v as? [String: Any] else { continue }
+                func f(_ source: [String: Any], _ key: String) -> Double { (source[key] as? NSNumber)?.doubleValue ?? 0 }
+                func rate(_ source: [String: Any]) -> Rate {
+                    var r = Rate()
+                    r.input = f(source, "in"); r.output = f(source, "out")
+                    r.cacheRead = source["cache_read"] == nil ? r.input : f(source, "cache_read")
+                    r.cacheWrite = source["cache_write"] == nil ? r.input : f(source, "cache_write")
+                    return r
+                }
+                var r = Row(peak: rate(d), offpeak: nil)
+                if let multiplier = d["fast_multiplier"] as? NSNumber,
+                   CFGetTypeID(multiplier) != CFBooleanGetTypeID(),
+                   multiplier.doubleValue.isFinite, multiplier.doubleValue >= 1 {
+                    r.fastMultiplier = multiplier.doubleValue
+                }
+                // 行内币种覆盖表级默认：国产模型填 CNY、外国模型填 USD，留空则用 _currency
+                r.currency = (d["currency"] as? String) ?? currency
+                if let off = d["offpeak"] as? [String: Any] {
+                    let o = rate(off)
+                    if !o.isEmpty { r.offpeak = o }
+                }
+                // 全 0 视为"没填价"（示例文件里的占位行不该算出 ¥0.00 的假花费）
+                if r.peak.isEmpty, r.offpeak == nil { continue }
+                rows[k.lowercased()] = r
+            }
         }
-        recentFiles.sort { $0.mtime > $1.mtime }
-        
-        let interactions = parseRecentInteractions(recentFiles: recentFiles, maxCount: 3, now: now)
-        stats.recentInteractions = interactions
-        if let first = interactions.first {
-            stats.latestTimestamp = first.timestamp
-            stats.latestSecondsAgo = first.secondsAgo
-            stats.latestModel = first.model
-            stats.latestContext = first.contextTokens
-            stats.latestOutput = first.outputTokens
-            stats.latestThinking = first.thinkingTokens
-            stats.latestCacheHitRate = first.cacheHitRate
+
+        /// "09:00" → 540（当天第几分钟）。
+        static func minutes(_ hhmm: String) -> Int? {
+            let hm = hhmm.split(separator: ":")
+            guard hm.count == 2, let h = Int(hm[0]), let m = Int(hm[1]), (0..<24).contains(h), (0..<60).contains(m) else { return nil }
+            return h * 60 + m
         }
-        return stats
+
+        func row(for model: String) -> Row? {
+            let m = model.lowercased()
+            if let exact = rows[m] { return exact }
+            // 最长前缀命中："glm-4.7" 能覆盖 "glm-4.7-flash"；取最长的那条，避免被短名抢走
+            return rows.filter { m.hasPrefix($0.key) }.max { $0.key.count < $1.key.count }?.value
+        }
+
+        /// 该模型计价用的币种；命中不了就退回表级默认。
+        public func currency(for model: String) -> String {
+            row(for: model)?.currency ?? currency
+        }
+
+        /// ctx 是「全部输入」（新鲜 + 缓存读 + 缓存写），算价时要先把缓存部分扣出来。
+        /// 传 `at` 才能吃到峰谷价：没配 `_peak`/`offpeak` 的模型恒用峰时价，结果和以前一样。
+        public func cost(model: String, ctx: Int64, cacheRead: Int64, cacheWrite: Int64, out: Int64, at: Date? = nil, tier: String? = nil) -> Double? {
+            guard let r = row(for: model) else { return nil }
+            let rate: Rate
+            if let offpeak = r.offpeak, let at, !peak.isPeak(at) { rate = offpeak }
+            else { rate = r.peak }
+            let fresh = max(0, ctx - cacheRead - cacheWrite)
+            let fast = ["priority", "fast"].contains((tier ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+            return (Double(fresh) * rate.input + Double(cacheRead) * rate.cacheRead
+                    + Double(cacheWrite) * rate.cacheWrite + Double(out) * rate.output) / 1_000_000.0 * (fast ? r.fastMultiplier : 1)
+        }
     }
-    
-    public func killProcesses(pids: [Int]) -> (killedCount: Int, freedMB: Double) {
-        if pids.isEmpty { return (0, 0.0) }
-        let report = scan()
-        var freedMB: Double = 0.0
-        var killedCount = 0
-        for pid in pids {
-            kill(pid_t(pid), SIGTERM)
-            killedCount += 1
+
+    /// 订阅制 Coding Plan 的「请求数」上限（不是 token）。这类套餐没有公开用量接口，
+    /// 而且厂商明令禁止用非编程工具去调它的端点（会被判滥用、可能停用订阅），
+    /// 所以我们既不探测、也不猜价 —— 只拿本机记账的请求数 ÷ 上限估，并在面板上标明「估算」。
+    /// 上限从 ~/.config/vibedeck/plans.json 读（照官方套餐页自己填）。
+    public struct PlanLimit {
+        public var label: String = ""
+        public var five: Int = 0
+        public var weekly: Int = 0
+        public var monthly: Int = 0
+    }
+
+    private var planCache: (mtime: TimeInterval, plans: [String: PlanLimit])? = nil
+
+    private func planLimits() -> [String: PlanLimit] {
+        let path = "\(home)/.config/vibedeck/plans.json"
+        guard let probe = vgFileStat(path) else { return [:] }
+        let mtime = probe.mtime
+        if let c = planCache, c.mtime == mtime { return c.plans }
+        var out: [String: PlanLimit] = [:]
+        for (k, v) in readJSON(path) ?? [:] where !k.hasPrefix("_") {
+            guard let d = v as? [String: Any] else { continue }
+            let req = d["requests"] as? [String: Any] ?? [:]
+            func n(_ key: String) -> Int { (req[key] as? NSNumber)?.intValue ?? 0 }
+            var p = PlanLimit()
+            p.label = d["plan"] as? String ?? k
+            p.five = n("5h"); p.weekly = n("weekly"); p.monthly = n("monthly")
+            if p.five > 0 || p.weekly > 0 || p.monthly > 0 { out[k] = p }
         }
+        planCache = (mtime, out)
+        return out
+    }
+
+    /// 滚动窗口内的请求数 → 额度窗口。重置点 = 窗口内最早那次调用 + 窗口长度（容量什么时候开始回来）
+    public static func rollingWindow(_ stamps: [TimeInterval], seconds: Double, limit: Int, now: TimeInterval) -> QuotaWindow? {
+        guard limit > 0 else { return nil }
+        let inWindow = stamps.filter { $0 >= now - seconds }
+        let pct = min(100, Int((Double(inWindow.count) / Double(limit) * 100).rounded()))
+        return QuotaWindow(usedPct: pct, resetsAt: inWindow.min().map { $0 + seconds }, capturedAt: now, windowSeconds: seconds)
+    }
+
+    private var priceCache: (mtime: TimeInterval, table: PriceTable)? = nil
+
+    private func priceTable() -> PriceTable {
+        let path = "\(home)/.config/vibedeck/prices.json"
+        guard let probe = vgFileStat(path) else { return PriceTable() }
+        let mtime = probe.mtime
+        if let c = priceCache, c.mtime == mtime { return c.table }
+        let t = readJSON(path).map { PriceTable(json: $0) } ?? PriceTable()
+        priceCache = (mtime, t)
+        return t
+    }
+    private var apiCalls: [APICall] = []
+    private var apiFile = FileParseState()          // 只用 mtime/size/parsedOffset/head
+    private var healthCache: (at: TimeInterval, running: Bool, calls: Int)? = nil
+
+    private func parseAPICallLine(_ line: Substring) -> APICall? {
+        guard let data = line.data(using: .utf8),
+              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let ts = (j["epoch"] as? NSNumber)?.doubleValue ?? parseISO(j["ts"] as? String) ?? 0
+        guard ts > 0, let host = j["host"] as? String else { return nil }
+        func n(_ k: String) -> Int64 { Int64((j[k] as? NSNumber)?.intValue ?? 0) }
+        return APICall(ts: ts, host: host, provider: j["provider"] as? String ?? host,
+                       model: (j["model"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "?",
+                       ctx: n("ctx"), cacheRead: n("cache_read"), cacheWrite: n("cache_write"),
+                       out: n("out"), think: n("think"),
+                       status: (j["status"] as? NSNumber)?.intValue ?? 0,
+                       ms: (j["ms"] as? NSNumber)?.intValue ?? 0,
+                       key: j["key"] as? String ?? "",
+                       rl: (j["rl"] as? [String: Any])?.compactMapValues { $0 as? String } ?? [:])
+    }
+
+    /// api-calls.jsonl 也是 append-only：同样的 offset 增量 + 指纹识别重写；
+    /// 保留 31 天（Coding Plan 有"月"窗口要算；一条记录几十字节，18000 次/月也就一两 MB）
+    private func ingestAPICalls() {
+        let path = ProxyManager.shared.callsPath
+        guard let probe = vgFileStat(path) else {
+            apiCalls = []
+            apiFile = FileParseState()
+            return
+        }
+        let mtime = probe.mtime
+        let size = probe.size
+        if apiFile.mtime == mtime && apiFile.size == size { return }
+        guard let fh = FileHandle(forReadingAtPath: path) else { return }
+        defer { try? fh.close() }
+        let head = (try? fh.read(upToCount: 256)) ?? Data()
+        if size < apiFile.size || head != apiFile.head {
+            apiFile = FileParseState()
+            apiCalls = []
+        }
+        apiFile.head = head
+        do { try fh.seek(toOffset: apiFile.parsedOffset) } catch { return }
+        let data = fh.readDataToEndOfFile()
+        if let lastNL = data.lastIndex(of: 0x0A) {
+            let chunk = data[data.startIndex...lastNL]
+            for line in String(decoding: chunk, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: true) {
+                if let c = parseAPICallLine(line) { apiCalls.append(c) }
+            }
+            apiFile.parsedOffset += UInt64(chunk.count)
+        }
+        apiFile.mtime = mtime
+        apiFile.size = size
+        let horizon = Date().timeIntervalSince1970 - 31 * 86400
+        if let first = apiCalls.first, first.ts < horizon { apiCalls.removeAll { $0.ts < horizon } }
+    }
+
+    // MARK: 限流响应头 → 额度（代理被动记下来的，不为查额度多发一个请求）
+
+    /// 把一组 `*ratelimit*` 响应头解析成「已用 % + 重置时刻」。
+    /// 各家写法不一，统一按「去掉 limit/remaining/reset 这个词，剩下的算同一族」来配对：
+    /// - Anthropic：`anthropic-ratelimit-requests-limit|-remaining|-reset`（reset 是 ISO8601）
+    /// - OpenAI：`x-ratelimit-limit-requests|-remaining-requests|-reset-requests`（reset 是 "6m0s" 这种时长）
+    /// - GitHub/通用：`x-ratelimit-limit|-remaining|-reset`（reset 是 epoch 秒；有的家给毫秒）
+    /// 多族并存时取最紧的那族（剩得最少的），标签带上族名让用户知道是按什么限的。
+    public static func parseRateLimitHeaders(_ headers: [String: String],
+                                             now: TimeInterval = Date().timeIntervalSince1970)
+        -> (usedPct: Int, resetsAt: TimeInterval?, label: String)? {
+        var fams: [String: (limit: Double?, remaining: Double?, reset: String?)] = [:]
+        for (rawKey, value) in headers {
+            let key = rawKey.lowercased()
+            guard key.contains("ratelimit") || key.contains("rate-limit") else { continue }
+            var parts = key.split(separator: "-").map(String.init)
+            guard let idx = parts.firstIndex(where: { ["limit", "remaining", "reset"].contains($0) }) else { continue }
+            let kind = parts.remove(at: idx)
+            let family = parts.joined(separator: "-")
+            var f = fams[family] ?? (nil, nil, nil)
+            switch kind {
+            case "limit": f.limit = Double(value)
+            case "remaining": f.remaining = Double(value)
+            default: f.reset = value
+            }
+            fams[family] = f
+        }
+
+        var best: (usedPct: Int, resetsAt: TimeInterval?, label: String)? = nil
+        for (family, f) in fams {
+            guard let limit = f.limit, limit > 0, let remaining = f.remaining else { continue }
+            let used = Int(((limit - remaining) / limit * 100).rounded())
+            let reset = f.reset.flatMap { parseResetValue($0, now: now) }
+            // 族名里去掉噪声词，剩下 requests/tokens 这类才有信息量
+            let name = family.split(separator: "-").filter { !["x", "anthropic", "ratelimit", "rate", "openai"].contains($0) }
+                .joined(separator: "-")
+            let label = name.isEmpty ? "限流" : name
+            if best == nil || used > best!.usedPct { best = (max(0, min(100, used)), reset, label) }
+        }
+        return best
+    }
+
+    /// reset 字段三种写法：epoch 秒 / epoch 毫秒 / 相对时长（"6m0s"、"30s"、"1500ms"）/ ISO8601
+    static func parseResetValue(_ raw: String, now: TimeInterval) -> TimeInterval? {
+        let v = raw.trimmingCharacters(in: .whitespaces)
+        if let iso = Fmt.parseISODate(v) { return iso }
+        if let n = Double(v) {
+            if n > 1_000_000_000_000 { return n / 1000 }     // 毫秒时间戳
+            if n > 1_000_000_000 { return n }                // 秒时间戳
+            return now + n                                   // 纯数字的相对秒数
+        }
+        // "6m0s" / "1h2m3s" / "500ms"
+        guard let re = try? NSRegularExpression(pattern: #"(\d+(?:\.\d+)?)(ms|h|m|s)"#) else { return nil }
+        let ns = v as NSString
+        let ms = re.matches(in: v, range: NSRange(location: 0, length: ns.length))
+        guard !ms.isEmpty else { return nil }
+        var secs = 0.0
+        for m in ms {
+            let n = Double(ns.substring(with: m.range(at: 1))) ?? 0
+            switch ns.substring(with: m.range(at: 2)) {
+            case "ms": secs += n / 1000
+            case "h": secs += n * 3600
+            case "m": secs += n * 60
+            default: secs += n
+            }
+        }
+        return now + secs
+    }
+
+    // MARK: 额度采样（算"当前节奏"用）
+
+    /// 每个额度窗口按时间记若干 (时刻, 已用%)，用来算近期速度。
+    /// 键里带重置点 → 窗口一换就是新键，天然不会把上个窗口的样本混进来。
+    /// 落盘 `~/.config/vibedeck/quota-samples.json`，重启不丢；只留 6 小时，文件几十 KB。
+    private var qsamples: [String: [(t: TimeInterval, pct: Int)]] = [:]
+    private var qsamplesLoaded = false
+    private var qsamplesSavedAt: TimeInterval = 0
+    private var samplesPath: String { "\(home)/.config/vibedeck/quota-samples.json" }
+    private static let sampleKeep: TimeInterval = 6 * 3600
+    private static let sampleEvery: TimeInterval = 55          // 扫描每 8s 一次，别记那么密
+
+    private func loadSamples() {
+        guard !qsamplesLoaded else { return }
+        qsamplesLoaded = true
+        guard let json = readJSON(samplesPath) else { return }
+        for (k, v) in json {
+            guard let arr = v as? [[Double]] else { continue }
+            qsamples[k] = arr.compactMap { $0.count == 2 ? (t: $0[0], pct: Int($0[1])) : nil }
+        }
+    }
+
+    private func saveSamplesIfDue(_ now: TimeInterval) {
+        guard now - qsamplesSavedAt >= 120 else { return }
+        qsamplesSavedAt = now
+        var out: [String: [[Double]]] = [:]
+        for (k, arr) in qsamples { out[k] = arr.map { [$0.t, Double($0.pct)] } }
+        guard let data = try? JSONSerialization.data(withJSONObject: out) else { return }
+        do {
+            let dir = "\(home)/.config/vibedeck"
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+            try data.write(to: URL(fileURLWithPath: samplesPath), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: samplesPath)
+        } catch {
+            log.error("额度样本保存失败")
+        }
+    }
+
+    /// 记一笔样本，并把"近期速度"回填进窗口。lookback 内取最老的一个样本做两点差。
+    private func sampleAndFill(_ w: inout QuotaWindow, key rawKey: String, now: TimeInterval) {
+        guard let reset = w.resetsAt else { return }
+        loadSamples()
+        let key = "\(rawKey)@\(Int(reset))"
+        let pct = w.effectivePct(now: now)
+        var arr = qsamples[key] ?? []
+        if arr.last.map({ now - $0.t >= Self.sampleEvery }) ?? true {
+            arr.append((t: now, pct: pct))
+            arr.removeAll { now - $0.t > Self.sampleKeep }
+            qsamples[key] = arr
+            // 键会随窗口重置而变，老键留着没用 —— 顺手清掉超过保留期的整条
+            qsamples = qsamples.filter { !($0.value.last.map { now - $0.t > Self.sampleKeep } ?? true) }
+        }
+        // 近 1 小时内最老的样本 → 两点差。跨度不足 10 分钟就不算（噪声太大）
+        guard let oldest = arr.first(where: { now - $0.t <= 3600 }) else { return }
+        let spanSec = now - oldest.t
+        guard spanSec >= 600 else { return }
+        let delta = Double(pct - oldest.pct)
+        guard delta >= 0 else { return }                      // 只会涨；掉了说明数据源换了口径，别用
+        w.recentPctPerHour = delta / (spanSec / 3600)
+        w.recentSpanMinutes = Int(spanSec / 60)
+    }
+
+    /// 给一个平台的所有额度窗口记样本（在 scanActiveLLMs 末尾统一做，卡片与详情页都能拿到）
+    private func sampleLLMQuotas(_ llm: inout DetectedLLMRuntime, now: TimeInterval) {
+        if llm.fiveHour != nil { sampleAndFill(&llm.fiveHour!, key: "\(llm.name)|5h", now: now) }
+        if llm.sevenDay != nil { sampleAndFill(&llm.sevenDay!, key: "\(llm.name)|w", now: now) }
+        if llm.secondaryFiveHour != nil { sampleAndFill(&llm.secondaryFiveHour!, key: "\(llm.name)|sec5h", now: now) }
+        if llm.secondarySevenDay != nil { sampleAndFill(&llm.secondarySevenDay!, key: "\(llm.name)|secw", now: now) }
+    }
+
+    // MARK: 记账覆盖体检（哪些 BASE_URL 没走代理）
+
+    private var coverageCache: (at: TimeInterval, cov: ProxyCoverage)? = nil
+
+    /// 从一行 shell 配置里抠出「变量名 + 上游主机」。**只取这两样**：同一行常常跟着 API key，
+    /// 我们既不解析也不保存它。返回 nil = 这行没有 BASE_URL。
+    public static func parseBaseURLLine(_ raw: String, proxyPrefix: String) -> (name: String, host: String, proxied: Bool)? {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        guard !line.hasPrefix("#") else { return nil }
+        // URL 取到第一个引号/空白/反斜杠为止：zsh 里这些行常以续行符 \ 结尾
+        guard let re = try? NSRegularExpression(pattern: #"([A-Z0-9_]*(?:BASE_URL|API_BASE|BASE_URI))\s*=\s*["']?([^"'\s\\]+)"#) else { return nil }
+        let ns = line as NSString
+        guard let m = re.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { return nil }
+        let name = ns.substring(with: m.range(at: 1))
+        var url = ns.substring(with: m.range(at: 2))
+        let proxied = url.hasPrefix(proxyPrefix)
+        if proxied { url = String(url.dropFirst(proxyPrefix.count)) }
+        // 取主机：可能是 https://host/path，也可能被代理前缀包成 http://127.0.0.1:18790/https://host/path
+        let host = url
+            .replacingOccurrences(of: #"^https?://"#, with: "", options: .regularExpression)
+            .split(separator: "/").first.map(String.init) ?? url
+        guard !host.isEmpty, host.contains(".") || host.contains(":") else { return nil }
+        return (name, host, proxied)
+    }
+
+    /// 扫 shell 配置。只读用户自己的 rc 文件，60s 节流。
+    public func scanProxyCoverage() -> ProxyCoverage {
+        let now = Date().timeIntervalSince1970
+        if let c = coverageCache, now - c.at < 60 { return c.cov }
+        let prefix = ProxyManager.shared.prefix
+        var cov = ProxyCoverage()
+        for f in [".zshrc", ".zshenv", ".bashrc", ".bash_profile", ".profile"] {
+            let path = "\(home)/\(f)"
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { continue }
+            for (i, line) in text.components(separatedBy: "\n").enumerated() {
+                guard let e = Self.parseBaseURLLine(line, proxyPrefix: prefix) else { continue }
+                cov.entries.append(ProxyCoverage.Entry(name: e.name, host: e.host, file: f, line: i + 1, proxied: e.proxied))
+            }
+        }
+        coverageCache = (now, cov)
+        return cov
+    }
+
+    private func balanceText(_ d: [String: Any]) -> String {
+        let cur = (d["currency"] as? String ?? "").uppercased()
+        let sym = cur == "CNY" ? "¥" : (cur == "USD" ? "$" : (cur.isEmpty ? "" : cur + " "))
+        if let b = (d["balance"] as? NSNumber)?.doubleValue { return String(format: "余额 %@%.2f", sym, b) }
+        if let u = (d["usage"] as? NSNumber)?.doubleValue {
+            if let l = (d["limit"] as? NSNumber)?.doubleValue { return String(format: "已用 %@%.2f / %@%.2f", sym, u, sym, l) }
+            return String(format: "已用 %@%.2f", sym, u)
+        }
+        return ""
+    }
+
+    public func scanAPI() -> ProxyStatus {
+        lock.lock(); defer { lock.unlock() }
+        let pm = ProxyManager.shared
+        var st = ProxyStatus()
+        st.installed = pm.isInstalled
+        st.port = pm.port
+        let now = Date().timeIntervalSince1970
+        if let h = healthCache, now - h.at < 5 {
+            st.running = h.running
+            st.callsSinceStart = h.calls
+        } else {
+            let h = pm.health()
+            healthCache = (now, h != nil, h?.calls ?? 0)
+            st.running = h != nil
+            st.callsSinceStart = h?.calls ?? 0
+        }
+
+        ingestAPICalls()
+        let startOfToday = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        let prices = priceTable()
+        let engine = CostEngine(user: prices)
+        var byHost: [String: APIProviderStatus] = [:]
+        var latency: [String: [Int]] = [:]              // host → 今日各次耗时（算 p50/p95）
+        var byKey: [String: [String: APIKeyUsage]] = [:]  // host → 指纹 → 用量
+
+        for c in apiCalls where c.ts >= startOfToday {
+            var p = byHost[c.host] ?? APIProviderStatus(host: c.host, provider: c.provider)
+            p.calls += 1
+            if c.status >= 400 || c.status == 0 { p.errors += 1 }
+            if c.status == 429 { p.count429 += 1 }
+            p.ctx += c.ctx
+            p.cacheRead += c.cacheRead
+            p.out += c.out
+            p.think += c.think
+            p.lastTS = max(p.lastTS, c.ts)
+            if !p.models.contains(c.model) { p.models.append(c.model) }
+
+            // 用户价目表优先，Claude / OpenAI 官方模型没配也按内置价估
+            let priced = engine.cost(model: c.model, ctx: c.ctx, cacheRead: c.cacheRead, cacheWrite: c.cacheWrite, out: c.out,
+                                     at: Date(timeIntervalSince1970: c.ts))
+            if let priced { p.cost[priced.currency, default: 0] += priced.value }
+            byHost[c.host] = p
+
+            if c.ms > 0 { latency[c.host, default: []].append(c.ms) }
+
+            let fp = c.key.isEmpty ? "无 key" : c.key
+            var k = byKey[c.host]?[fp] ?? APIKeyUsage(fingerprint: fp)
+            k.calls += 1
+            if c.status >= 400 || c.status == 0 { k.errors += 1 }
+            k.ctx += c.ctx
+            k.out += c.out
+            k.lastTS = max(k.lastTS, c.ts)
+            if let priced { k.cost[priced.currency, default: 0] += priced.value }
+            if !k.models.contains(c.model) { k.models.append(c.model) }
+            byKey[c.host, default: [:]][fp] = k
+        }
+
+        // 限流头：只认该上游最近一条带头的调用（旧的没参考价值）
+        var lastRL: [String: (t: TimeInterval, rl: [String: String])] = [:]
+        for c in apiCalls where !c.rl.isEmpty {
+            if c.ts > (lastRL[c.host]?.t ?? 0) { lastRL[c.host] = (c.ts, c.rl) }
+        }
+        for (host, v) in lastRL {
+            guard now - v.t < 3600,                              // 一小时前的余量早就变了
+                  let q = Self.parseRateLimitHeaders(v.rl, now: now) else { continue }
+            byHost[host]?.headerWindow = QuotaWindow(usedPct: q.usedPct, resetsAt: q.resetsAt, capturedAt: v.t)
+            byHost[host]?.headerLabel = q.label
+        }
+
+        for (host, ms) in latency {
+            byHost[host]?.p50ms = Fmt.percentile(ms, 0.50)
+            byHost[host]?.p95ms = Fmt.percentile(ms, 0.95)
+            byHost[host]?.maxms = ms.max() ?? 0
+        }
+        for (host, keys) in byKey {
+            byHost[host]?.keys = keys.values.sorted { $0.calls > $1.calls }
+        }
+
+        // 订阅制 Coding Plan：厂商不给用量接口 → 按本机记账的请求数估。滚动窗口，标明是估算。
+        let plans = planLimits()
+        if !plans.isEmpty {
+            var stamps: [String: [TimeInterval]] = [:]       // provider → 各次调用时刻（31 天内）
+            for c in apiCalls { stamps[c.provider, default: []].append(c.ts) }
+            for (key, plan) in plans {
+                guard let host = byHost.first(where: { $0.value.provider == key || $0.key == key })?.key,
+                      let ts = stamps[byHost[host]!.provider] else { continue }
+                byHost[host]?.plan = plan.label
+                byHost[host]?.quotaIsEstimate = true
+                let in5h = ts.filter { $0 >= now - 5 * 3600 }.count
+                byHost[host]?.estimateNote = plan.five > 0 ? "本机记账 \(in5h) 次 / \(plan.five)" : "本机记账 \(in5h) 次"
+                byHost[host]?.planLimitText = "5h \(plan.five) · 周 \(plan.weekly) · 月 \(plan.monthly) 次"
+                byHost[host]?.fiveHour = Self.rollingWindow(ts, seconds: 5 * 3600, limit: plan.five, now: now)
+                byHost[host]?.sevenDay = Self.rollingWindow(ts, seconds: 7 * 86400, limit: plan.weekly, now: now)
+                byHost[host]?.monthly = Self.rollingWindow(ts, seconds: 30 * 86400, limit: plan.monthly, now: now)
+            }
+        }
+        if let q = readJSON(pm.quotaPath) {
+            for (host, v) in q {
+                guard let d = v as? [String: Any] else { continue }
+                var p = byHost[host] ?? APIProviderStatus(host: host, provider: d["provider"] as? String ?? host)
+                let cap = (d["captured_at"] as? NSNumber)?.doubleValue
+                if let e = d["error"] as? String { p.quotaError = e }
+                let kind = d["kind"] as? String ?? ""
+                if kind == "quota" {
+                    p.plan = d["plan"] as? String ?? ""
+                    let wins = d["windows"] as? [String: Any] ?? [:]
+                    func win(_ k: String) -> QuotaWindow? {
+                        guard let w = wins[k] as? [String: Any], let used = clampPct(w["used_pct"] as? NSNumber) else { return nil }
+                        return QuotaWindow(usedPct: used, resetsAt: (w["resets_at"] as? NSNumber)?.doubleValue, capturedAt: cap,
+                                           windowSeconds: k == "5h" ? 5 * 3600 : 7 * 86400)
+                    }
+                    p.fiveHour = win("5h")
+                    p.sevenDay = win("weekly")
+                } else if kind == "balance" {
+                    p.balanceText = balanceText(d)
+                }
+                byHost[host] = p
+            }
+        }
+        st.coverage = scanProxyCoverage()
+        st.hasPriceTable = !prices.isEmpty
+        st.priceAsOf = prices.asOf
+        st.providers = byHost.values.sorted { $0.lastTS > $1.lastTS }.map { p in
+            var p = p       // API 上游的额度也记采样，火山这种估算窗口同样能给"当前节奏"
+            if p.fiveHour != nil { sampleAndFill(&p.fiveHour!, key: "api|\(p.provider)|5h", now: now) }
+            if p.sevenDay != nil { sampleAndFill(&p.sevenDay!, key: "api|\(p.provider)|w", now: now) }
+            return p
+        }
+        saveSamplesIfDue(now)
+        return st
+    }
+
+    // MARK: 清理动作
+
+    // 连续两次扫描都在、且已孤儿 minSeconds 以上，才允许静默清理
+    private var orphanFirstSeen: [Int: (at: TimeInterval, cmd: String)] = [:]
+
+    public func stableOrphans(_ orphans: [OrphanProc], minSeconds: Double) -> [OrphanProc] {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date().timeIntervalSince1970
+        var next: [Int: (at: TimeInterval, cmd: String)] = [:]
+        var out: [OrphanProc] = []
+        for o in orphans {
+            if let prev = orphanFirstSeen[o.pid], prev.cmd == o.cmd {
+                next[o.pid] = prev
+                if now - prev.at >= minSeconds { out.append(o) }
+            } else {
+                next[o.pid] = (now, o.cmd)      // 第一次见到，这轮不动它
+            }
+        }
+        orphanFirstSeen = next
+        return out
+    }
+
+    /// 按「快照里记下的命令行」逐个复核后再杀。
+    /// 面板上的快照最多 8 秒前，而 macOS 的 pid 会回绕复用 —— 直接按旧 pid 开枪有可能打到刚起来的别的进程。
+    /// 复核：pid 仍存在、ppid 仍为 1、命令行与快照一致；任一不符就跳过。
+    /// 先 SIGTERM，300ms 后仍存活的补 SIGKILL。
+    public func killProcesses(_ targets: [OrphanProc]) -> (killed: Int, skipped: Int, freedMB: Double) {
+        if targets.isEmpty { return (0, 0, 0) }
+        lock.lock()
+        let live = readProcs()
+        lock.unlock()
+
+        var confirmed: [OrphanProc] = []
+        var skipped = 0
+        for t in targets {
+            guard let p = live[t.pid], p.ppid == 1, p.cmd == t.cmd else {
+                skipped += 1
+                log.notice("kill skipped pid=\(t.pid) (已消失或 pid 被复用)")
+                continue
+            }
+            confirmed.append(t)
+        }
+        for t in confirmed { kill(pid_t(t.pid), SIGTERM) }
         usleep(300_000)
-        for pid in pids {
-            if kill(pid_t(pid), 0) == 0 {
-                kill(pid_t(pid), SIGKILL)
+        lock.lock()
+        let remaining = readProcs()
+        lock.unlock()
+        for t in confirmed where kill(pid_t(t.pid), 0) == 0 {
+            // SIGTERM 后 pid 仍可能被复用，补刀也必须核对原快照。
+            guard let p = remaining[t.pid], p.ppid == 1, p.cmd == t.cmd else {
+                log.notice("SIGKILL skipped pid=\(t.pid) (已消失或 pid 被复用)")
+                continue
             }
+            kill(pid_t(t.pid), SIGKILL)
         }
-        freedMB = report.totalOrphanMemMB
-        return (killedCount, freedMB)
+        return (confirmed.count, skipped, confirmed.reduce(0.0) { $0 + $1.memMB })
     }
-    
-    public func cleanNPXCache() -> Double {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let npxPath = "\(home)/.npm/_npx"
-        var freedMB: Double = 0.0
-        if FileManager.default.fileExists(atPath: npxPath) {
-            let duOut = execute("/usr/bin/du -sk '\(npxPath)'")
-            if let first = duOut.components(separatedBy: "\t").first, let kb = Double(first.trimmingCharacters(in: .whitespaces)) {
-                freedMB = kb / 1024.0
+
+    public func cleanNPXCache() -> Double? {
+        resourceStateLock.lock()
+        guard !npxCleanupPending else { resourceStateLock.unlock(); return nil }
+        npxCleanupPending = true
+        npxCache = nil
+        npxScanGeneration += 1
+        npxLastAttemptAt = 0
+        resourceStateLock.unlock()
+        return resourceQueue.sync {
+            defer {
+                resourceStateLock.lock()
+                npxCache = nil
+                npxScanPending = false
+                npxLastAttemptAt = 0
+                npxCleanupPending = false
+                resourceStateLock.unlock()
             }
-            _ = execute("/bin/rm -rf '\(npxPath)'/*")
+            let npxPath = "\(home)/.npm/_npx"
+            let fm = FileManager.default
+            guard let probe = vgFileStat(npxPath, followSymlinks: false), probe.isDirectory else { return 0.0 }
+            let npxURL = URL(fileURLWithPath: npxPath)
+            let npmRoot = URL(fileURLWithPath: "\(home)/.npm").resolvingSymlinksInPath().standardizedFileURL
+            let resolved = npxURL.resolvingSymlinksInPath().standardizedFileURL
+            guard resolved.path.hasPrefix(npmRoot.path + "/") else {
+                log.error("拒绝清理 NPX 缓存：目录是符号链接或解析后越界")
+                return nil
+            }
+            let before = measureNPXCacheMB()
+            do {
+                // 逐项删除不会沿子项的符号链接清理目标目录，也不需要把路径拼进 shell。
+                for url in try fm.contentsOfDirectory(at: resolved, includingPropertiesForKeys: nil) {
+                    try fm.removeItem(at: url)
+                }
+                return before
+            } catch {
+                log.error("NPX 缓存清理失败")
+                return nil
+            }
         }
-        return freedMB
     }
 }

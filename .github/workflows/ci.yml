@@ -1,0 +1,51 @@
+name: Build & Verify
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Compile and Bundle VibeDeck
+      run: |
+        chmod +x ./build.sh
+        OUTPUT_DIR=. ./build.sh
+
+    - name: Run Headless Self-Test
+      run: |
+        ./VibeDeck.app/Contents/MacOS/VibeDeck --selftest -AppleLanguages '(zh-Hans)'
+        ./VibeDeck.app/Contents/MacOS/VibeDeck --selftest -AppleLanguages '(en)'
+        ./VibeDeck.app/Contents/Library/LaunchServices/VibeDeckFanHelper --selftest
+        ./VibeDeck.app/Contents/Library/LaunchServices/VibeDeckFanHelper --selftest-xpc
+
+    - name: Self-Test Intel Slice (Rosetta)
+      run: |
+        lipo -archs VibeDeck.app/Contents/MacOS/VibeDeck | grep -q x86_64
+        /usr/sbin/softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 || true
+        arch -x86_64 ./VibeDeck.app/Contents/MacOS/VibeDeck --selftest -AppleLanguages '(en)'
+
+    - name: First-Launch Smoke Test (clean machine, no AI tools installed)
+      run: |
+        ./VibeDeck.app/Contents/MacOS/VibeDeck -AppleLanguages '(en)' &
+        pid=$!
+        sleep 15
+        kill -0 "$pid"   # still running = no crash on first launch
+        kill "$pid"
+
+    - name: Test Python Proxy Self-Test
+      run: |
+        /usr/bin/python3 Resources/vibedeck-proxy.py --selftest
+        /usr/bin/python3 Resources/vibedeck-collector.py --selftest

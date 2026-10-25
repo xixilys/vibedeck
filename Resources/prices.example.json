@@ -1,0 +1,18 @@
+{
+  "_comment": "复制到 ~/.config/vibedeck/prices.json 后自己填价。单位 = 每百万 token。VibeDeck 内置 API 参考价（prices.builtin.json，带来源和日期）；已核实的 OpenAI / Claude 价与保留的社区参考价分别标注。其他模型在这里填，同名时这里优先。gpt-6.1-sol 已内置官方输入/缓存读/缓存写/输出价 $2/$0.10/$2.50/$10（每百万 token），超过 272K 输入整单升档，Fast 2 倍；不要填平价覆盖来丢失这些规则。用户覆盖价不自动继承内置倍率；可在行内设置 fast_multiplier（如 Astra 为 2）显式对 priority/fast 请求加价一次，省略或为 1 则不加。该倍率同时适用于峰谷价。全 0 的行视为「没填价」，面板上会显示「该模型不在价目表里」而不是 0.00。用户模型名按最长前缀命中，所以填 \"glm-4.7\" 就能覆盖 \"glm-4.7-flash\"。opencode 记的是它自己的 modelID（如 \"deepseek-v4-pro\"），按你实际用到的模型名填一行即可。cache_read / cache_write 省略时按 in 计。每行可加 \"currency\" 覆盖 _currency：国产模型填 CNY、外国模型填 USD，面板会按币种并列显示（不做汇率换算）。峰谷价：_peak 定义峰时窗口（时区 + HH:MM-HH:MM），行内 offpeak 填闲时价，成本按每条记录的时间选档。懒得手填就用菜单「同步模型价格」从 models.dev 补齐（跳过已有内置价；补齐缺失价，刷新未被手改的自动同步行）。",
+  "_comment_en": "Copy to ~/.config/vibedeck/prices.json and fill in your own prices, per million tokens. VibeDeck ships dated API reference prices (prices.builtin.json), distinguishing verified OpenAI / Claude pricing from retained community references; add everything else here. Rows here override the built-in ones. All-zero rows count as 'not priced' (the panel says so instead of showing 0.00). User model names match by longest prefix, so \"glm-4.7\" also covers \"glm-4.7-flash\". opencode reports its own modelID (e.g. \"deepseek-v4-pro\"), so add one row per model you actually use. cache_read / cache_write default to 'in' when omitted. Any row may set \"currency\" to override _currency (CNY for domestic, USD for foreign); the panel shows each currency side by side and never converts at a guessed rate. Time-of-day pricing: _peak defines peak windows (timezone + HH:MM-HH:MM) and a row's offpeak gives off-peak rates; cost is picked per event timestamp. Sync skips built-in prices and refreshes only unchanged automatically synced rows. User overrides do not inherit built-in multipliers. A row may set fast_multiplier (for example, 2 for Astra) to explicitly surcharge priority/fast requests once after peak/off-peak selection. Omit it or use 1 if rates already include Fast. Set _asof to the date you copied the prices.",
+  "_asof": "填你抄价那天的日期，面板会显示它，提醒你这数字有多旧",
+  "_currency": "CNY",
+  "_peak": { "tz": "Asia/Shanghai", "windows": ["09:00-12:00", "14:00-18:00"] },
+
+  "gpt-6-astra": { "in": 0, "cache_read": 0, "out": 0, "currency": "USD", "fast_multiplier": 2 },
+  "glm-4.7": { "in": 0, "cache_read": 0, "cache_write": 0, "out": 0, "currency": "CNY" },
+  "kimi-k2": { "in": 0, "out": 0, "currency": "CNY" },
+  "deepseek-chat": { "in": 0, "cache_read": 0, "out": 0, "currency": "CNY" },
+  "deepseek-v4-pro": { "in": 0, "cache_read": 0, "out": 0, "currency": "CNY",
+                       "offpeak": { "in": 0, "cache_read": 0, "out": 0 } },
+  "deepseek-v4-flash": { "in": 0, "cache_read": 0, "out": 0, "currency": "CNY" },
+  "doubao-seed": { "in": 0, "out": 0, "currency": "CNY" },
+  "qwen": { "in": 0, "out": 0, "currency": "CNY" },
+  "gpt-5.5": { "in": 0, "out": 0, "currency": "USD" }
+}
