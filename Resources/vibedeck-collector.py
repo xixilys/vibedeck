@@ -23,6 +23,10 @@ _FIELDS = (("model", "$.modelID"), ("provider", "$.providerID"), ("inp", "$.toke
 SQL_COLS = ("id, session_id, time_created, time_updated, "
             + ", ".join("json_extract(data,'%s') AS %s" % (p, n) for n, p in _FIELDS) + ", data AS raw")
 WHERE = "json_extract(data,'$.role')='assistant' AND json_extract(data,'$.tokens') IS NOT NULL"
+_FIELDS_V2 = (("model", "$.model.id"), ("provider", "$.model.providerID")) + _FIELDS[2:]
+SQL_COLS_V2 = ("id, session_id, time_created, time_updated, "
+               + ", ".join("json_extract(data,'%s') AS %s" % (p, n) for n, p in _FIELDS_V2) + ", data AS raw")
+WHERE_V2 = "type='assistant' AND json_extract(data,'$.tokens') IS NOT NULL"
 
 def resolve_db(explicit):
     # 默认：$XDG_DATA_HOME/opencode/opencode.db，否则 ~/.local/share/opencode/opencode.db
@@ -60,16 +64,24 @@ def run(db_path, since):
         conn.execute("PRAGMA busy_timeout=4000")
         conn.execute("PRAGMA query_only=1")
         cur = conn.cursor()
-        sql = "SELECT " + SQL_COLS + " FROM message WHERE " + WHERE
-        params = ()
-        if since and since > 0:
-            sql += " AND time_updated > ? ORDER BY time_updated"
-            params = (since,)
-        cur.execute(sql, params)
+        tables = set(r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'"))
+        # opencode v1.2x moved assistant rows from `message` to `session_message` (model under data.model).
+        queries = []
+        if "message" in tables:
+            queries.append("SELECT " + SQL_COLS + " FROM message WHERE " + WHERE)
+        if "session_message" in tables:
+            queries.append("SELECT " + SQL_COLS_V2 + " FROM session_message WHERE " + WHERE_V2)
+        rows = []
+        for sql in queries:
+            params = ()
+            if since and since > 0:
+                sql += " AND time_updated > ? ORDER BY time_updated"
+                params = (since,)
+            rows.extend(cur.execute(sql, params).fetchall())
         out = sys.stdout
         count = 0
         max_u = 0
-        for row in cur:
+        for row in rows:
             # 防御：data 解析失败就静默跳过，绝不崩溃、绝不输出
             try:
                 data = json.loads(row[11])
@@ -409,27 +421,40 @@ def _codex_quotas(home, now, include_identity=False):
     return (best, plan, best_captured, account) if include_identity else (best, plan, best_captured)
 
 def _grok_quota(home):
+    """Newest "fetched credits config" line. Grok ≥1.0.67 no longer logs it, so the newest one can sit well before
+    the log tail; widen once before giving up. The tier comes from the newest line that names it."""
     path = os.path.join(home, ".grok", "logs", "unified.jsonl")
     tier, best = "", None
-    for line in reversed(_read_tail(path, 512 * 1024)):
-        if "fetched credits config" not in line:
-            continue
+    for limit in (512 * 1024, 8 * 1024 * 1024):
+        lines = _read_tail(path, limit)
+        for line in reversed(lines):
+            if "fetched credits config" not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            ctx = row.get("ctx") if isinstance(row.get("ctx"), dict) else {}
+            cfg = ctx.get("config") if isinstance(ctx.get("config"), dict) else {}
+            if not tier and isinstance(ctx.get("subscriptionTier"), str):
+                tier = ctx["subscriptionTier"]
+            if best is not None:
+                if tier: break
+                continue
+            period = cfg.get("currentPeriod") if isinstance(cfg.get("currentPeriod"), dict) else {}
+            # Grok omits creditUsagePercent while it is 0 (protobuf default); a period without it means unused.
+            used = _pct(cfg.get("creditUsagePercent", 0 if period else None))
+            if used is None:
+                continue
+            start, end = _iso_epoch(period.get("start")), _iso_epoch(period.get("end"))
+            captured = _iso_epoch(row.get("ts"))
+            best = _window(used, end, captured, max(0, end - start) if start is not None and end is not None else None)
         try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        ctx = row.get("ctx") if isinstance(row.get("ctx"), dict) else {}
-        cfg = ctx.get("config") if isinstance(ctx.get("config"), dict) else {}
-        used = _pct(cfg.get("creditUsagePercent"))
-        if used is None:
-            continue
-        period = cfg.get("currentPeriod") if isinstance(cfg.get("currentPeriod"), dict) else {}
-        start, end = _iso_epoch(period.get("start")), _iso_epoch(period.get("end"))
-        captured = _iso_epoch(row.get("ts"))
-        best = _window(used, end, captured, max(0, end - start) if start is not None and end is not None else None)
-        value = ctx.get("subscriptionTier")
-        tier = value if isinstance(value, str) else ""
-        break
+            whole = os.path.getsize(path) <= limit
+        except OSError:
+            whole = True
+        if best is not None or whole:
+            break
     return best, tier
 
 def _agy_quotas(home):
@@ -456,6 +481,82 @@ def _agy_quotas(home):
             "secondary_name": "3p",
             "secondary_five_hour": parse("3p", "5h", 5 * 3600),
             "secondary_seven_day": parse("3p", "weekly", 7 * 86400)}, captured_default
+
+def _glm_keys(home):
+    """(host, key) pairs for GLM Coding Plan keys opencode already uses; env vars as fallback."""
+    out = []
+    def add(host, key):
+        if isinstance(key, str) and key.strip() and (host, key.strip()) not in out:
+            out.append((host, key.strip()))
+    try:
+        with open(os.path.join(home, ".config", "opencode", "opencode.json"), encoding="utf-8") as fh:
+            providers = json.load(fh).get("provider") or {}
+    except (OSError, ValueError, AttributeError):
+        providers = {}
+    for name, cfg in providers.items() if isinstance(providers, dict) else []:
+        opts = cfg.get("options") if isinstance(cfg, dict) and isinstance(cfg.get("options"), dict) else {}
+        base = str(opts.get("baseURL") or "")
+        if "bigmodel.cn" in base or "api.z.ai" in base or name in ("zhipuai-coding-plan", "zai-coding-plan"):
+            key = opts.get("apiKey")
+            m = re.match(r"^\{env:(\w+)\}$", key or "") if isinstance(key, str) else None
+            if m: key = os.environ.get(m.group(1), "")
+            add("api.z.ai" if "z.ai" in base or name.startswith("zai") else "open.bigmodel.cn", key)
+    for env, host in (("ZHIPU_API_KEY", "open.bigmodel.cn"), ("ZAI_API_KEY", "api.z.ai")):
+        add(host, os.environ.get(env, ""))
+    return out
+
+def _glm_quota(home, now=None):
+    """GLM Coding Plan windows from /api/monitor/usage/quota/limit, cached 5 min so every pull does not call it.
+    Returns a platform row or None. The key never leaves this host; only its 8-char fingerprint is reported."""
+    import hashlib
+    now = time.time() if now is None else now
+    cache_path = os.path.join(home, ".cache", "vibedeck", "glm-quota.json")
+    try:
+        with open(cache_path, encoding="utf-8") as fh:
+            cached = json.load(fh)
+        if isinstance(cached, dict) and now - float(cached.get("at", 0)) < 300:
+            return cached.get("row")
+    except (OSError, ValueError, TypeError):
+        pass
+    row = None
+    for host, key in _glm_keys(home)[:2]:
+        try:
+            import urllib.request
+            req = urllib.request.Request("https://%s/api/monitor/usage/quota/limit" % host,
+                                         headers={"Authorization": "Bearer " + key, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                body = json.loads(resp.read(256 * 1024).decode("utf-8", "replace"))
+        except Exception:
+            continue
+        data = body.get("data") if isinstance(body, dict) else None
+        if body.get("code") != 200 or not isinstance(data, dict):
+            continue
+        limits = [l for l in (data.get("limits") or []) if isinstance(l, dict) and _finite_number(l.get("percentage")) is not None]
+        def seconds(l):
+            unit, number = l.get("unit"), _finite_number(l.get("number")) or 1
+            return {3: 3600, 4: 86400, 5: 86400, 6: 7 * 86400, 7: 30 * 86400}.get(unit, 0) * number
+        limits.sort(key=lambda l: seconds(l) or _finite_number(l.get("nextResetTime")) or 0)
+        quota = {}
+        for l in limits:
+            span = seconds(l)
+            slot = "five_hour" if 0 < span <= 6 * 3600 else "seven_day"
+            if slot in quota:
+                continue
+            reset = _finite_number(l.get("nextResetTime"))
+            quota[slot] = _window(_finite_number(l.get("percentage")), reset / 1000.0 if reset else None, now, span or None)
+        level = str(data.get("level") or "")
+        row = {"tier": ("Coding " + level.capitalize()) if level else "Coding Plan", "sessions": 0, "quota": quota,
+               "captured_at": now, "plan_key": hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]}
+        break
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp = cache_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"at": now, "row": row}, fh)
+        os.chmod(tmp, 0o600); os.replace(tmp, cache_path)
+    except OSError:
+        pass
+    return row
 
 def _session_counts():
     names = ("claude", "codex", "grok", "agy")
@@ -547,10 +648,13 @@ def collect_platform_quotas(home, now=None):
             "codex": row(tier=codex_tier, quota=codex_quota, captured=codex_capture),
             "grok": row(tier=grok_tier, quota={"seven_day": grok_window}, captured=grok_window.get("captured_at") if grok_window else None),
             "agy": row(tier="已登录" if has_agy_quota else "", quota=agy_quota or {}, captured=agy_capture)}
+    glm = _glm_quota(home, now)
+    if glm:
+        rows["glm"] = glm
     rows["codex"].update(codex_account)
     rows["claude"].update(_claude_quota_identity(home, claude))
     for key in rows:
-        rows[key]["sessions"] = sessions[key]
+        rows[key]["sessions"] = sessions.get(key, 0)
         if not sessions_ok: rows[key]["note"] = "session_count_unavailable"
     return rows
 
@@ -1355,7 +1459,116 @@ def _codex_file_records(path, include_metadata=False):
         result.extend(turns.values())
     return result
 
-def collect_records(home, since_ms, include_metadata=False, include_identity_backfill=False):
+_DSH_DAYS = 35
+
+def _dsh_files(home, cutoff_ms):
+    root = os.path.join(home, ".dsh", "sessions")
+    out = []
+    for dp, _d, names in os.walk(root, onerror=lambda _e: None):
+        for nm in names:
+            if nm.startswith("session.") and (nm.endswith(".jsonl.zstd") or nm.endswith(".jsonl")):
+                p = os.path.join(dp, nm)
+                if _mtime_ms(p) > cutoff_ms:
+                    out.append(p)
+    return out
+
+def _dsh_lines(path, zstd):
+    if not path.endswith(".zstd"):
+        return _read_lines(path)
+    if not zstd:
+        return []
+    try:
+        proc = subprocess.run([zstd, "-dcq", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return proc.stdout.decode("utf-8", "replace").splitlines() if proc.returncode == 0 else []
+
+def _model_free(model):
+    m = model.lower()
+    return m.endswith("-free") or ":free" in m or "-free/" in m or "zen-free" in m
+
+def _dsh_records(home, since_ms, now=None):
+    """DeepSeek's DSH: one record per assistant message from its zstd session logs. Its cost-meter ledger can stop
+    recording days (seen on WSL since 2026-08-30), so the logs are the source. Free relay models cost 0."""
+    now = time.time() if now is None else now
+    cutoff = max(since_ms, int((now - _DSH_DAYS * 86400) * 1000))
+    zstd = shutil.which("zstd")
+    out, max_m = [], 0
+    for path in _dsh_files(home, -1):
+        mt = _mtime_ms(path)
+        max_m = max(max_m, mt)
+        if mt <= cutoff:
+            continue
+        session = os.path.basename(os.path.dirname(path))
+        for line in _dsh_lines(path, zstd):
+            if '"assistant/message"' not in line or '"usage"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            data = o.get("data") if isinstance(o, dict) else None
+            usage = data.get("usage") if isinstance(data, dict) else None
+            msg = data.get("message") if isinstance(data, dict) else None
+            if not isinstance(usage, dict) or not isinstance(msg, dict):
+                continue
+            src = msg.get("source") if isinstance(msg.get("source"), dict) else {}
+            t = _finite_number(o.get("time"))
+            rid = msg.get("id")
+            if t is None or not isinstance(rid, str) or not rid:
+                continue
+            fresh, cr = to_num(usage.get("inputTokens")), to_num(usage.get("cacheReadTokens"))
+            cw, th = to_num(usage.get("cacheWriteTokens")), to_num(usage.get("reasoningTokens"))
+            outp = to_num(usage.get("outputTokens"))
+            if fresh + cr + cw + outp <= 0:
+                continue
+            model = to_str(src.get("model")) or "?"
+            # "deepseek/deepseek-flash" → priced as deepseek-flash; relay prefixes stay for free models
+            priced = model.split("/", 1)[1] if model.lower().startswith("deepseek/") else model
+            rec = {"k": "dsh", "id": rid, "t": t / 1000.0, "m": priced, "p": to_str(src.get("provider")),
+                   "in": fresh + cr + cw, "cr": cr, "cw": cw, "out": outp + th, "th": th, "s": session}
+            if _model_free(model):
+                rec["c"], rec["cur"] = 0, "USD"
+            out.append(rec)
+    return out, max_m
+
+def _grok_records(home, since_ms):
+    """Grok CLI: per-turn usage from each session's usage.json, with xAI's own cost (1 USD = 1e10 ticks)."""
+    root = os.path.join(home, ".grok", "sessions")
+    out, max_m = [], 0
+    for dp, _d, names in os.walk(root, onerror=lambda _e: None):
+        if "usage.json" not in names:
+            continue
+        path = os.path.join(dp, "usage.json")
+        mt = _mtime_ms(path)
+        max_m = max(max_m, mt)
+        if mt <= since_ms:
+            continue
+        obj = _read_json_bounded([path], 4 * 1024 * 1024)
+        if not isinstance(obj, dict):
+            continue
+        session = to_str(obj.get("sessionId")) or os.path.basename(dp)
+        for turn in obj.get("turns") or []:
+            if not isinstance(turn, dict):
+                continue
+            t = _iso_epoch(turn.get("endedAt"))
+            n = turn.get("turnNumber")
+            if t is None or not isinstance(n, int):
+                continue
+            inp, outp = to_num(turn.get("inputTokens")), to_num(turn.get("outputTokens"))
+            if inp + outp <= 0:
+                continue
+            rec = {"k": "grok", "id": "%s:%d" % (session, n), "t": t, "m": to_str(turn.get("primaryModelId")) or "?",
+                   "in": inp, "cr": min(inp, to_num(turn.get("cachedReadTokens"))),
+                   "cw": to_num(turn.get("cacheCreationTokens")), "out": outp,
+                   "th": min(outp, to_num(turn.get("reasoningTokens"))), "s": session}
+            ticks = _finite_number(turn.get("costUsdTicks"))
+            if ticks is not None and ticks >= 0:
+                rec["c"], rec["cur"] = ticks / 1e10, "USD"
+            out.append(rec)
+    return out, max_m
+
+def collect_records(home, since_ms, include_metadata=False, include_identity_backfill=False, tools_since_ms=None):
     """返回 (记录列表, 最大 mtime 毫秒)。只看 mtime > since_ms 的文件。"""
     out, max_m = [], 0
     claude = {}
@@ -1422,13 +1635,21 @@ def collect_records(home, since_ms, include_metadata=False, include_identity_bac
                 if account: out.append(dict(account, k="account_session", cli="codex", s=os.path.basename(p)))
             continue
         out.extend(_codex_file_records(p, include_metadata=include_metadata))
+    for collect in (_dsh_records, _grok_records):
+        try:
+            recs, newest = collect(home, since_ms if tools_since_ms is None else tools_since_ms)
+        except Exception:
+            continue
+        out.extend(recs)
+        max_m = max(max_m, newest)
     return out, max_m
 
-def run_records(since, gz, include_identity_backfill=False):
+def run_records(since, gz, include_identity_backfill=False, tools_since=None):
     try:
-        recs, max_m = collect_records(os.path.expanduser("~"), since, include_metadata=True, include_identity_backfill=include_identity_backfill)
+        recs, max_m = collect_records(os.path.expanduser("~"), since, include_metadata=True, include_identity_backfill=include_identity_backfill,
+                                      tools_since_ms=tools_since)
         lines = [json.dumps(r, separators=(",", ":")) for r in recs]
-        lines.append(json.dumps({"__ok__": True, "count": sum(r.get("k") in ("claude", "codex") for r in recs), "max_mtime": max_m}, separators=(",", ":")))
+        lines.append(json.dumps({"__ok__": True, "count": sum(r.get("k") in ("claude", "codex", "dsh", "grok") for r in recs), "max_mtime": max_m}, separators=(",", ":")))
         text = "\n".join(lines) + "\n"
         if gz:
             co = zlib.compressobj(6, zlib.DEFLATED, -15)     # 原始 DEFLATE，Mac 端用 Foundation 直接解
@@ -2046,12 +2267,13 @@ def main(argv):
     parser.add_argument("--records", action="store_true", help="输出 Claude / Codex 逐条请求用量（mtime > --since 的文件）")
     parser.add_argument("--identity-backfill", action="store_true", help="另读 Codex session header 身份，不重拉旧用量")
     parser.add_argument("--gz", action="store_true", help="--records 输出压缩成一行 base64(raw deflate)")
+    parser.add_argument("--tools-since", type=int, default=None, help="DSH / Grok 记录单独的 mtime 游标（首次补采用 0）")
     parser.add_argument("--selftest", action="store_true", help="用临时目录自测解析口径")
     args = parser.parse_args(argv)
     if args.selftest:
         return selftest()
     if args.records:
-        return run_records(args.since, args.gz, args.identity_backfill)
+        return run_records(args.since, args.gz, args.identity_backfill, args.tools_since)
     if args.quotas:
         return run_quotas()
     if args.summary:

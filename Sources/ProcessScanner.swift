@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import os
 import Darwin
 
@@ -239,6 +240,9 @@ public struct DetectedLLMRuntime: Identifiable {
     /// Provider metadata from the same profile/capture as this quota. Unknown stays nil.
     public var account: AccountIdentity? = nil
     public var secondaryAccount: AccountIdentity? = nil
+    /// Coding plans without a sign-in identity (GLM): fingerprint of the key, so the same plan seen from
+    /// several devices is shown once.
+    public var planKey: String? = nil
 
     public var hasQuota: Bool { fiveHour != nil || sevenDay != nil || secondaryFiveHour != nil || secondarySevenDay != nil }
 }
@@ -2020,21 +2024,109 @@ public final class ProcessScanner {
                 guard let data = l.data(using: .utf8),
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let ctx = json["ctx"] as? [String: Any],
-                      let cfg = ctx["config"] as? [String: Any],
-                      let pct = clampPct(cfg["creditUsagePercent"] as? NSNumber) else { continue }
+                      let cfg = ctx["config"] as? [String: Any] else { continue }
+                if tier.isEmpty, let named = ctx["subscriptionTier"] as? String { tier = named }
+                if weekly != nil { if !tier.isEmpty { break outer }; continue }
                 let period = cfg["currentPeriod"] as? [String: Any]
+                // Grok omits creditUsagePercent while it is 0 (protobuf default): a period without it means unused.
+                guard let pct = clampPct(cfg["creditUsagePercent"] as? NSNumber ?? (period != nil ? 0 : nil)) else { continue }
                 let pStart = parseISO(period?["start"] as? String)
                 let pEnd = parseISO(period?["end"] as? String)
                 // 周期长度用它自己给的起止算；给不出就不推算（windowSeconds 留 0）
                 weekly = QuotaWindow(usedPct: pct, resetsAt: pEnd, capturedAt: parseISO(json["ts"] as? String),
                                      windowSeconds: (pStart != nil && pEnd != nil) ? max(0, pEnd! - pStart!) : 0)
-                tier = ctx["subscriptionTier"] as? String ?? ""
-                break outer
             }
+            if weekly != nil { break }
             if text.utf8.count < maxBytes { break }
         }
         grokQuotaCache = (mtime, size, weekly, tier)
         return (weekly, tier)
+    }
+
+    // MARK: GLM Coding Plan
+
+    struct GLMQuota {
+        var key: String
+        var tier: String
+        var fiveHour: QuotaWindow?
+        var weekly: QuotaWindow?
+        var error: String?
+    }
+    private var glmState: (at: TimeInterval, quota: GLMQuota?)? = nil
+    private var glmFetching = false
+
+    /// (host, key) for GLM Coding Plan keys opencode already uses. Keys stay in memory only.
+    static func glmKeys(home: String, environment: [String: String] = ProcessInfo.processInfo.environment) -> [(host: String, key: String)] {
+        var out: [(host: String, key: String)] = []
+        func add(_ host: String, _ key: String?) {
+            guard let key = key?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty,
+                  !out.contains(where: { $0.host == host && $0.key == key }) else { return }
+            out.append((host, key))
+        }
+        if let data = FileManager.default.contents(atPath: "\(home)/.config/opencode/opencode.json"),
+           let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let providers = root["provider"] as? [String: Any] {
+            for (name, value) in providers.sorted(by: { $0.key < $1.key }) {
+                guard let options = (value as? [String: Any])?["options"] as? [String: Any] else { continue }
+                let base = options["baseURL"] as? String ?? ""
+                guard base.contains("bigmodel.cn") || base.contains("api.z.ai") || name == "zhipuai-coding-plan" || name == "zai-coding-plan" else { continue }
+                var key = options["apiKey"] as? String
+                if let k = key, k.hasPrefix("{env:"), k.hasSuffix("}") { key = environment[String(k.dropFirst(5).dropLast())] }
+                add(base.contains("z.ai") || name.hasPrefix("zai") ? "api.z.ai" : "open.bigmodel.cn", key)
+            }
+        }
+        add("open.bigmodel.cn", environment["ZHIPU_API_KEY"])
+        add("api.z.ai", environment["ZAI_API_KEY"])
+        return out
+    }
+
+    /// Pure: `/api/monitor/usage/quota/limit` → windows. unit 3 = hours, 6 = weeks (observed 2026-10).
+    static func parseGLMQuota(_ json: [String: Any], key: String, now: TimeInterval) -> GLMQuota? {
+        guard (json["code"] as? NSNumber)?.intValue == 200, let data = json["data"] as? [String: Any] else { return nil }
+        func seconds(_ l: [String: Any]) -> Double {
+            let unit = (l["unit"] as? NSNumber)?.intValue ?? 0, number = (l["number"] as? NSNumber)?.doubleValue ?? 1
+            return ([3: 3600, 4: 86400, 5: 86400, 6: 7 * 86400, 7: 30 * 86400][unit] ?? 0) * number
+        }
+        var quota = GLMQuota(key: key, tier: "Coding Plan")
+        if let level = data["level"] as? String, !level.isEmpty { quota.tier = "Coding " + level.capitalized }
+        let limits = (data["limits"] as? [[String: Any]] ?? []).filter { $0["percentage"] is NSNumber }.sorted { seconds($0) < seconds($1) }
+        for l in limits {
+            let span = seconds(l)
+            let reset = (l["nextResetTime"] as? NSNumber).map { $0.doubleValue / 1000 }
+            let window = QuotaWindow(usedPct: max(0, min(100, (l["percentage"] as! NSNumber).intValue)), resetsAt: reset, capturedAt: now, windowSeconds: span)
+            if span > 0 && span <= 6 * 3600 { if quota.fiveHour == nil { quota.fiveHour = window } }
+            else if quota.weekly == nil { quota.weekly = window }
+        }
+        return quota
+    }
+
+    /// Cached result; refreshes in the background at most every 5 minutes, never blocking the scan.
+    private func readGLMQuota() -> GLMQuota? {
+        let keys = Self.glmKeys(home: home)
+        guard let first = keys.first else { return nil }
+        let now = Date().timeIntervalSince1970
+        let fingerprint = Self.fingerprint(first.key)
+        if (glmState.map { now - $0.at >= 300 } ?? true), !glmFetching {
+            glmFetching = true
+            var request = URLRequest(url: URL(string: "https://\(first.host)/api/monitor/usage/quota/limit")!, timeoutInterval: 8)
+            request.setValue("Bearer " + first.key, forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+                let json = data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+                var parsed = json.flatMap { Self.parseGLMQuota($0, key: fingerprint, now: Date().timeIntervalSince1970) }
+                if parsed == nil {
+                    let message = (json?["msg"] as? String) ?? error?.localizedDescription ?? L("额度接口无响应", "No response")
+                    parsed = GLMQuota(key: fingerprint, tier: "Coding Plan", error: L("智谱 · ", "Zhipu · ") + String(message.prefix(24)))
+                }
+                guard let self else { return }
+                self.lock.lock(); self.glmState = (Date().timeIntervalSince1970, parsed); self.glmFetching = false; self.lock.unlock()
+            }.resume()
+        }
+        return glmState?.quota ?? GLMQuota(key: fingerprint, tier: "Coding Plan", error: L("智谱 · 正在读取额度", "Zhipu · reading quota"))
+    }
+
+    static func fingerprint(_ key: String) -> String {
+        String(SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined().prefix(8))
     }
 
     /// Gemini（Antigravity）：agy-hud 写的 quota_cache.json，两个池：gemini / 3p
@@ -2218,6 +2310,16 @@ public final class ProcessScanner {
                 quotaSubtitle: "xAI · 无额度数据 (grok 未跑过)",
                 platformDetail: grokDetail(c)
             ))
+        }
+
+        // GLM Coding Plan（opencode 已配置的 key；后台每 5 分钟查一次额度）
+        if let glm = readGLMQuota() {
+            var runtime = DetectedLLMRuntime(
+                name: "GLM", isRunning: false, tier: glm.tier, detail: "Coding Plan",
+                fiveHour: glm.fiveHour, sevenDay: glm.weekly,
+                quotaSubtitle: glm.error ?? L("智谱 · 额度暂不可读", "Zhipu · quota unavailable"))
+            runtime.planKey = glm.key
+            list.append(runtime)
         }
 
         // Ollama（探测结果缓存 10s，避免 ticker 每秒阻塞）

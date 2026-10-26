@@ -202,19 +202,38 @@ enum DSHUsage {
         var records: [String: UsageHistory.Record] = [:]
         for (key, value) in root["days"] as? [String: Any] ?? [:] {
             guard let day = value as? [String: Any], let start = formatter.date(from: key)?.timeIntervalSince1970 else { continue }
-            func count(_ name: String) -> Int64 { max(0, (day[name] as? NSNumber)?.int64Value ?? 0) }
-            let input = count("input"), cacheRead = count("cacheRead"), cacheWrite = count("cacheWrite")
-            let output = count("output"), reasoning = count("reasoning")
-            guard input + cacheRead + cacheWrite + output + reasoning > 0 else { continue }
             // A finished day sits at noon; today's running total sits at the ledger's last write.
             let end = start + 86_400
             let timestamp = now < end ? min(now, max(start, modified)) : start + 43_200
-            let id = "dsh:" + key
-            records[id] = UsageHistory.Record(
-                id: id, source: "DSH", timestamp: timestamp, model: model,
-                usage: UsageHistory.ModelTotals(ctx: input + cacheRead + cacheWrite, cacheRead: cacheRead, cacheWrite: cacheWrite,
-                                                out: output + reasoning, think: reasoning),
-                session: id)
+            // Newer ledgers split each day by "provider:model" with the cost DSH itself charged; older ones only
+            // have day totals, which keep the fixed model and the price table.
+            var parts: [(id: String, model: String, row: [String: Any], billed: UsageHistory.BilledCost?)] = []
+            if let split = day["byProviderModel"] as? [String: Any], !split.isEmpty {
+                for (name, raw) in split.sorted(by: { $0.key < $1.key }) {
+                    guard let row = raw as? [String: Any] else { continue }
+                    let bare = name.split(separator: ":", maxSplits: 1).last.map(String.init) ?? name
+                    let cost: UsageHistory.BilledCost?
+                    if let cny = (row["costCny"] as? NSNumber)?.doubleValue, cny.isFinite, cny >= 0 { cost = .init(value: cny, currency: "CNY") }
+                    else if let usd = (row["cost"] as? NSNumber)?.doubleValue, usd.isFinite, usd >= 0 { cost = .init(value: usd, currency: "USD") }
+                    else { cost = nil }
+                    parts.append(("dsh:" + key + ":" + name, bare, row, cost))
+                }
+            } else {
+                parts.append(("dsh:" + key, model, day, nil))
+            }
+            for part in parts {
+                func count(_ name: String) -> Int64 { max(0, (part.row[name] as? NSNumber)?.int64Value ?? 0) }
+                let input = count("input"), cacheRead = count("cacheRead"), cacheWrite = count("cacheWrite")
+                let output = count("output"), reasoning = count("reasoning")
+                guard input + cacheRead + cacheWrite + output + reasoning > 0 else { continue }
+                var record = UsageHistory.Record(
+                    id: part.id, source: "DSH", timestamp: timestamp, model: part.model,
+                    usage: UsageHistory.ModelTotals(ctx: input + cacheRead + cacheWrite, cacheRead: cacheRead, cacheWrite: cacheWrite,
+                                                    out: output + reasoning, think: reasoning),
+                    session: "dsh:" + key)
+                record.billed = part.billed
+                records[part.id] = record
+            }
         }
         var balance: Balance?
         if let ref = root["balanceRef"] as? [String: Any], let total = (ref["total"] as? NSNumber)?.doubleValue, total.isFinite {
@@ -222,5 +241,60 @@ enum DSHUsage {
             balance = Balance(amount: total, currency: (ref["currency"] as? String) ?? "CNY", asOf: at > 0 ? at : modified)
         }
         return (records, balance)
+    }
+}
+
+/// Grok CLI (≥1.0.6x) writes per-turn usage, with xAI's own cost in USD ticks (1 USD = 1e10), to each
+/// session's `usage.json`. One record per turn; ids are stable across rereads.
+enum GrokUsage {
+    static func records(path: String) -> [String: UsageHistory.Record] {
+        guard let data = FileManager.default.contents(atPath: path),
+              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return [:] }
+        let session = root["sessionId"] as? String ?? (path as NSString).deletingLastPathComponent
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let plain = ISO8601DateFormatter()
+        func date(_ text: String?) -> TimeInterval? {
+            guard var text else { return nil }
+            // Nanosecond fractions are longer than ISO8601DateFormatter accepts; keep milliseconds.
+            if let dot = text.firstIndex(of: "."), let end = text[dot...].firstIndex(where: { $0 == "+" || $0 == "-" || $0 == "Z" }) {
+                let fraction = text[text.index(after: dot)..<end]
+                text = String(text[..<dot]) + "." + String(fraction.prefix(3)) + String(text[end...])
+            }
+            return (iso.date(from: text) ?? plain.date(from: text))?.timeIntervalSince1970
+        }
+        var out: [String: UsageHistory.Record] = [:]
+        for turn in root["turns"] as? [[String: Any]] ?? [] {
+            guard let n = (turn["turnNumber"] as? NSNumber)?.intValue, let t = date(turn["endedAt"] as? String) else { continue }
+            func count(_ key: String) -> Int64 { max(0, (turn[key] as? NSNumber)?.int64Value ?? 0) }
+            let input = count("inputTokens"), output = count("outputTokens")
+            guard input + output > 0 else { continue }
+            let id = "grok:\(session):\(n)"
+            var record = UsageHistory.Record(
+                id: id, source: "Grok", timestamp: t, model: turn["primaryModelId"] as? String ?? "?",
+                usage: UsageHistory.ModelTotals(ctx: input, cacheRead: min(input, count("cachedReadTokens")),
+                                                cacheWrite: count("cacheCreationTokens"), out: output,
+                                                think: min(output, count("reasoningTokens"))),
+                session: session)
+            if let ticks = (turn["costUsdTicks"] as? NSNumber)?.doubleValue, ticks.isFinite, ticks >= 0 {
+                record.billed = UsageHistory.BilledCost(value: ticks / 1e10, currency: "USD")
+            }
+            out[id] = record
+        }
+        return out
+    }
+
+    /// `~/.grok/sessions/<cwd>/<session>/usage.json`
+    static func files(home: String) -> [String] {
+        let root = "\(home)/.grok/sessions"
+        let fm = FileManager.default
+        var out: [String] = []
+        for dir in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
+            for sub in (try? fm.contentsOfDirectory(atPath: "\(root)/\(dir)")) ?? [] {
+                let path = "\(root)/\(dir)/\(sub)/usage.json"
+                if fm.fileExists(atPath: path) { out.append(path) }
+            }
+        }
+        return out
     }
 }

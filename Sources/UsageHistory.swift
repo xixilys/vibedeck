@@ -227,6 +227,14 @@ public final class UsageHistory {
         var tier: String? = nil
         var timing: PerformanceTiming? = nil
         var account: AccountIdentity? = nil
+        /// Cost the tool itself reported (DSH ledger, Grok's costUsdTicks, free relay models = 0). When set it
+        /// replaces the price-table estimate for both billed and API-equivalent value.
+        var billed: BilledCost? = nil
+    }
+
+    struct BilledCost: Codable, Equatable {
+        var value: Double
+        var currency: String
     }
 
     /// 文件内同 requestId 取 token 最多的那条（流式分块会先写一个不完整的 usage），跨文件同理。
@@ -266,6 +274,7 @@ public final class UsageHistory {
         var account: AccountIdentity? = nil
         // Retain genuine IDs for known accounts so exact cross-device dedup survives compaction.
         var exactRequestID: String? = nil
+        var billed: BilledCost? = nil
     }
 
     private static let legacyCacheEncoding = CodingUserInfoKey(rawValue: "historyLegacyJSON")!
@@ -403,12 +412,15 @@ public final class UsageHistory {
         var turnLatencies: [TurnLatencySample]? = nil
         var turnModels: [String: String]? = nil
         var failedTurns: Set<String>? = nil
+        /// Remote sources only: 1 once DSH / Grok records had their one-time full pull.
+        var toolsVersion: Int? = nil
 
         init(source: String, records: [String: Record] = [:]) { self.source = source; self.records = records }
         private enum CodingKeys: String, CodingKey {
             case source, model, size, mtime, offset, head, previousTotal, skipped, cursor, fullAt, tier, hasUsageRecords, forked, burstLast, burstFirstId, burstDone, replayed, frozenBefore, frozenSessions, frozenRecordCount, frozenClaudeIDs, frozenPeakDefinition
             case records, frozen, recordsPacked, frozenPacked, timings, ancestors, previousEventAt, latestResponseID, timingFetched
             case account, recordAccounts, frozenAccounts, frozenRequestIDs, metadataVersion, turnLatencies, turnModels, failedTurns
+            case recordCosts, frozenCosts, toolsVersion
         }
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -455,6 +467,11 @@ public final class UsageHistory {
             for (index, id) in try c.decodeIfPresent([String: String].self, forKey: .frozenRequestIDs) ?? [:] {
                 if let i = Int(index), frozen?.indices.contains(i) == true { frozen?[i].exactRequestID = id }
             }
+            toolsVersion = try c.decodeIfPresent(Int.self, forKey: .toolsVersion)
+            for (id, cost) in try c.decodeIfPresent([String: BilledCost].self, forKey: .recordCosts) ?? [:] { records[id]?.billed = cost }
+            for (index, cost) in try c.decodeIfPresent([String: BilledCost].self, forKey: .frozenCosts) ?? [:] {
+                if let i = Int(index), frozen?.indices.contains(i) == true { frozen?[i].billed = cost }
+            }
         }
         func encode(to encoder: Encoder) throws {
             var c = encoder.container(keyedBy: CodingKeys.self)
@@ -469,6 +486,12 @@ public final class UsageHistory {
             for (i, b) in (frozen ?? []).enumerated() { frozenAccounts[String(i)] = b.account; frozenRequestIDs[String(i)] = b.exactRequestID }
             if !frozenAccounts.isEmpty { try c.encode(frozenAccounts, forKey: .frozenAccounts) }
             if !frozenRequestIDs.isEmpty { try c.encode(frozenRequestIDs, forKey: .frozenRequestIDs) }
+            try c.encodeIfPresent(toolsVersion, forKey: .toolsVersion)
+            let recordCosts = records.compactMapValues { $0.billed }
+            if !recordCosts.isEmpty { try c.encode(recordCosts, forKey: .recordCosts) }
+            var frozenCosts: [String: BilledCost] = [:]
+            for (i, b) in (frozen ?? []).enumerated() { frozenCosts[String(i)] = b.billed }
+            if !frozenCosts.isEmpty { try c.encode(frozenCosts, forKey: .frozenCosts) }
             try c.encodeIfPresent(ancestors, forKey: .ancestors)
             try c.encodeIfPresent(previousEventAt, forKey: .previousEventAt)
             try c.encodeIfPresent(latestResponseID, forKey: .latestResponseID)
@@ -943,6 +966,7 @@ public final class UsageHistory {
         }
         ingestOpenCode()
         ingestDSH()
+        ingestGrok()
         publishProgress(paths.count + 1, total: units)
         trimTimings(now: now)
         // SSH 冷扫描可能很慢；先让本机的新数据可见，远端仍保留上次记录。
@@ -1116,6 +1140,21 @@ public final class UsageHistory {
         updateFile(path, state)
     }
 
+    /// Grok CLI per-turn usage (`usage.json` per session). Unchanged files are not reread.
+    private func ingestGrok() {
+        for path in GrokUsage.files(home: home) {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 else { continue }
+            let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+            var state = cache.files[path] ?? FileState(source: "Grok")
+            if state.mtime == modified && state.size == size { continue }
+            state.source = "Grok"
+            state.mtime = modified; state.size = size
+            state.records = GrokUsage.records(path: path).filter { $0.value.timestamp >= (state.frozenBefore ?? 0) }
+            updateFile(path, state)
+        }
+    }
+
     private static let dshLock = NSLock()
     private static var dshBalanceValue: DSHUsage.Balance?
     /// Last DeepSeek balance DSH's cost meter saw; read by the panel's API quota list.
@@ -1153,7 +1192,9 @@ public final class UsageHistory {
             let incrementalSince = max(0, (cli.cursor ?? 0) - 600_000)
             let metadataBackfill = cli.metadataVersion != 1
             let since = !metadataBackfill && cli.timingFetched == true ? incrementalSince : min(incrementalSince, Int64((now - 86400) * 1000))
-            switch RemoteCollector.pullCLIRecords(host: host, since: since, includeIdentityBackfill: metadataBackfill) {
+            // DSH / Grok records arrived after the Claude/Codex cursor; pull their history once, then follow the cursor.
+            switch RemoteCollector.pullCLIRecords(host: host, since: since, includeIdentityBackfill: metadataBackfill,
+                                                  toolsSince: cli.toolsVersion == 1 ? nil : 0) {
             case .failure(let error):
                 remoteCLIStatus[host] = error.message
                 log.notice("remote cli \(host, privacy: .public) 未连上：\(error.message, privacy: .public)")
@@ -1161,6 +1202,7 @@ public final class UsageHistory {
                 remoteCLIStatus[host] = nil
                 cli.timingFetched = true
                 cli.metadataVersion = 1
+                cli.toolsVersion = 1
                 if !pull.turnLatencies.isEmpty { cli.turnLatencies = Self.mergedTurnLatencies((cli.turnLatencies ?? []) + pull.turnLatencies, now: now) }
                 if !pull.sessionAccounts.isEmpty {
                     for id in cli.records.keys {
@@ -1722,6 +1764,7 @@ public final class UsageHistory {
         var longContext: Bool
         var account: AccountIdentity?
         var exactRequestID: String?
+        var billedCurrency: String? = nil
     }
 
     private func claudeWinners() -> [String: [String: (path: String, record: Record)]] {
@@ -1763,9 +1806,10 @@ public final class UsageHistory {
             func add(_ bucket: FrozenBucket) {
                 var b = bucket
                 if b.timestamp < horizon && b.exactRequestID == nil { b.timestamp = Self.hourStart(b.timestamp) }
-                let key = FrozenKey(source: b.source, model: b.model, tier: b.tier, timestamp: b.timestamp, peak: b.peak, longContext: b.longContext, account: b.account, exactRequestID: b.exactRequestID)
+                let key = FrozenKey(source: b.source, model: b.model, tier: b.tier, timestamp: b.timestamp, peak: b.peak, longContext: b.longContext, account: b.account, exactRequestID: b.exactRequestID, billedCurrency: b.billed?.currency)
                 if var old = buckets[key] {
                     old.usage.add(b.usage); old.fresh += b.fresh; old.cw1h += b.cw1h
+                    if let cost = b.billed { old.billed = BilledCost(value: (old.billed?.value ?? 0) + cost.value, currency: cost.currency) }
                     old.turns += b.turns; old.cumulative += b.cumulative
                     old.minContext = min(old.minContext, b.minContext); old.maxContext = max(old.maxContext, b.maxContext)
                     buckets[key] = old
@@ -1793,7 +1837,8 @@ public final class UsageHistory {
                                  usage: u, fresh: max(0, u.ctx - u.cacheRead - u.cacheWrite),
                                  cw1h: max(0, min(record.cw1h ?? 0, u.cacheWrite)), turns: 1,
                                  cumulative: record.cumulative ? 1 : 0, minContext: u.ctx, maxContext: u.ctx, account: record.account,
-                                 exactRequestID: record.account == nil ? nil : AccountUsage.exactRequestID(record.id, source: record.source)))
+                                 exactRequestID: record.account == nil ? nil : AccountUsage.exactRequestID(record.id, source: record.source),
+                                 billed: record.billed))
             }
             state.frozen = Array(buckets.values)
             if !oldRecords.isEmpty { state.frozenBefore = max(state.frozenBefore ?? 0, boundary) }
@@ -1808,6 +1853,7 @@ public final class UsageHistory {
     }
 
     private func frozenCost(_ bucket: FrozenBucket, engine: CostEngine) -> (value: Double, currency: String)? {
+        if let billed = bucket.billed { return (billed.value, billed.currency) }
         let u = bucket.usage
         if CostEngine.isSubscriptionIncluded(bucket.model) { return (0, "USD") }
         if var row = engine.user.row(for: bucket.model) {
@@ -1836,7 +1882,7 @@ public final class UsageHistory {
 
     private func frozenEquivalentCost(_ bucket: FrozenBucket, engine: CostEngine) -> (value: Double, currency: String)? {
         // Existing frozen pricing handles request bands/peak grouping. Subscription records need a distinct API valuation.
-        if !CostEngine.isSubscriptionIncluded(bucket.model) { return frozenCost(bucket, engine: engine) }
+        if bucket.billed != nil || !CostEngine.isSubscriptionIncluded(bucket.model) { return frozenCost(bucket, engine: engine) }
         var b = bucket
         b.model = String(bucket.model.dropFirst("chatgpt-web/".count))
         var equivalent = engine
@@ -1918,7 +1964,8 @@ public final class UsageHistory {
             f.dailySessions[day, default: [:]][record.source, default: []].insert(session)
             if Self.kind(of: state.source) == .claude, claudeWinners[state.source]?[record.id]?.path != path { continue }
             let u = record.usage
-            let equivalent = engine.equivalentCost(model: record.model, ctx: u.ctx, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
+            let equivalent = record.billed.map { (value: $0.value, currency: $0.currency) }
+                ?? engine.equivalentCost(model: record.model, ctx: u.ctx, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
                 cacheWrite1h: record.cw1h ?? 0, out: u.out, tier: record.tier, at: Date(timeIntervalSince1970: record.timestamp))
             f.accountPoints.append(AccountUsagePoint(timestamp: record.timestamp, source: record.source, model: record.model,
                 account: record.account, pool: AccountUsage.pool(model: record.model, source: record.source), usage: u,
@@ -1933,7 +1980,7 @@ public final class UsageHistory {
             }
             add(source: record.source, model: record.model, at: record.timestamp, usage: u, turns: 1,
                 cumulative: record.cumulative ? 1 : 0,
-                cost: engine.cost(model: record.model, ctx: u.ctx, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
+                cost: record.billed.map { (value: $0.value, currency: $0.currency) } ?? engine.cost(model: record.model, ctx: u.ctx, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
                                   cacheWrite1h: record.cw1h ?? 0, out: u.out, tier: record.tier, at: Date(timeIntervalSince1970: record.timestamp)))
         }
         return f

@@ -203,11 +203,12 @@ enum RemoteCollector {
         var sessionAccounts: [String: AccountIdentity] = [:]
     }
 
-    static func pullCLIRecords(host: String, since: Int64, includeIdentityBackfill: Bool = false) -> Result<CLIRecordBatch, RemoteFailure> {
+    static func pullCLIRecords(host: String, since: Int64, includeIdentityBackfill: Bool = false, toolsSince: Int64? = nil) -> Result<CLIRecordBatch, RemoteFailure> {
         guard let script = script() else { return .failure(RemoteFailure(message: "读不到采集脚本")) }
         let arguments = ["--records", "--since", String(max(0, since)), "--gz"] + (includeIdentityBackfill ? ["--identity-backfill"] : [])
+            + (toolsSince.map { ["--tools-since", String(max(0, $0))] } ?? [])
         switch run(host: host, script: script, arguments: arguments,
-                   timeout: since == 0 ? 150 : 60) {
+                   timeout: since == 0 || toolsSince == 0 ? 150 : 60) {
         case .failure(let reason): return .failure(reason)
         case .success(let text):
             guard let jsonl = inflate(text) else { return .failure(RemoteFailure(message: "远端输出解不开（采集脚本太旧？）")) }
@@ -254,11 +255,11 @@ enum RemoteCollector {
                     milliseconds: milliseconds, startedAt: epoch(o["started_at"]), model: model, account: account, failed: failed))
                 continue
             }
-            guard let kind = o["k"] as? String, kind == "claude" || kind == "codex",
+            let labels = ["claude": "Claude", "codex": "Codex", "dsh": "DSH", "grok": "Grok"]
+            guard let kind = o["k"] as? String, let label = labels[kind],
                   let id = o["id"] as? String, !id.isEmpty,
                   let t = epoch(o["t"]) else { continue }
             func n(_ key: String) -> Int64 { max(0, (o[key] as? NSNumber)?.int64Value ?? 0) }
-            let label = kind == "claude" ? "Claude" : "Codex"
             let source = host.isEmpty ? label : label + " · " + host
             let model = (o["m"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "?"
             let usage = UsageHistory.ModelTotals(ctx: n("in"), cacheRead: n("cr"), cacheWrite: n("cw"), out: n("out"), think: n("th"))
@@ -267,6 +268,9 @@ enum RemoteCollector {
                                                session: o["s"] as? String, cw1h: c1 > 0 ? c1 : nil, tier: o["tier"] as? String,
                                                timing: finiteNumber(o["seconds"]).map { PerformanceTiming(seconds: $0) })
             record.account = account
+            if let value = finiteNumber(o["c"]), value >= 0, let currency = o["cur"] as? String, !currency.isEmpty {
+                record.billed = UsageHistory.BilledCost(value: value, currency: currency)
+            }
             batch.records.append(record)
         }
         return batch
@@ -358,7 +362,7 @@ enum RemoteCollector {
             if let summary = raw["__summary__"] as? [String: Any], let entries = summary["platforms"] as? [String: Any] { platforms = entries }
         }
         guard ok, let platforms else { return nil }
-        return [("claude", "Claude"), ("codex", "Codex"), ("grok", "Grok"), ("agy", "Antigravity")].compactMap { key, name in
+        return [("claude", "Claude"), ("codex", "Codex"), ("grok", "Grok"), ("agy", "Antigravity"), ("glm", "GLM")].compactMap { key, name in
             guard let row = platforms[key] as? [String: Any] else { return nil }
             let quota = row["quota"] as? [String: Any] ?? [:]
             let captured = epoch(row["captured_at"])
@@ -377,7 +381,9 @@ enum RemoteCollector {
                 isFullWidth: !extraName.isEmpty,
                 quotaSubtitle: L("未采集到额度", "Quota unavailable"),
                 account: parseAccountIdentity(row), secondaryAccount: parseAccountIdentity(row, prefix: "secondary_account_"))
-            return runtime
+            var planned = runtime
+            planned.planKey = row["plan_key"] as? String
+            return planned
         }
     }
 

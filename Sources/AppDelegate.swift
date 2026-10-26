@@ -1,4 +1,5 @@
 import Cocoa
+import Combine
 import SwiftUI
 import ServiceManagement
 import UserNotifications
@@ -29,8 +30,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var isPanelOpen = false
     private var isRelayoutScheduled = false
     private var panelGeneration: UInt = 0
+    /// The SwiftUI tree is kept for a while after the panel closes: rebuilding it on every click was the open lag.
+    private var cachedPanelKey: String?
+    private var panelClosedAt: TimeInterval = 0
+    private static let panelCacheSeconds: TimeInterval = 30 * 60
     private var pendingPanelHeight: CGFloat?
-    private var lastStatusImage: (percentage: Int, alert: Bool)?
+    private var pet: MenuBarPetAnimator?
+    private var petSample: AnyCancellable?
+    private var petAlert = false
+    private var petLabel: String?
     private weak var hostingView: SwipeHostingView<DashboardView>?
     private let log = Logger(subsystem: "io.github.xixilys.vibedeck", category: "menu")
 
@@ -199,6 +207,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel(_:))
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        if let button = statusItem.button {
+            pet = MenuBarPetAnimator(button: button)
+            // The pup's pace follows every CPU sample, not just the slower scan cadence.
+            petSample = SystemMonitor.shared.$latest.receive(on: DispatchQueue.main).sink { [weak self] sample in
+                guard let self, let cpu = sample.cpu else { return }
+                self.pet?.update(cpu: cpu * 100, alert: self.petAlert, label: self.petLabel)
+            }
+        }
         panelPopover.behavior = .transient
         panelPopover.animates = false
         panelPopover.delegate = self
@@ -217,7 +233,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         isPanelOpen = true
         NetworkScanner.shared.setPanelVisible(true)
         SystemMonitor.shared.setVisible(true)
-        buildPanel()
+        let reused = canReusePanel()
+        if !reused { buildPanel() }
         panelPopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         guard panelPopover.isShown else { finishClosingPanel(); return }
         // Only a user opening the panel activates it. Background refreshes never take focus.
@@ -225,7 +242,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         hostingView?.window?.makeKey()
         installSwipeMonitor()
         relayoutPanel()
+        if reused { NotificationCenter.default.post(name: .vibeDeckPanelReopened, object: nil) }
         updateStatus()
+    }
+
+    private var panelKey: String {
+        "\(UITheme.fontScale)|\(UserDefaults.standard.string(forKey: AppLanguage.defaultsKey) ?? "")"
+    }
+
+    private func canReusePanel() -> Bool {
+        guard hostingView != nil, panelPopover.contentViewController != nil, cachedPanelKey == panelKey,
+              Date().timeIntervalSince1970 - panelClosedAt < Self.panelCacheSeconds else { return false }
+        return true
+    }
+
+    private func dropPanelCache() {
+        panelPopover.contentViewController = nil
+        hostingView = nil
+        cachedPanelKey = nil
     }
 
     private func closePanel(restoreFocus: Bool = true) {
@@ -244,16 +278,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func finishClosingPanel() {
-        guard isPanelOpen || panelPopover.contentViewController != nil else { return }
+        guard isPanelOpen else { return }
         isPanelOpen = false
         NetworkScanner.shared.setPanelVisible(false)
         SystemMonitor.shared.setVisible(false)
-        panelGeneration &+= 1
+        // The generation stays: a kept panel still reports its height through the same actions.
         pendingPanelHeight = nil
         isRelayoutScheduled = false
         removeSwipeMonitor()
-        panelPopover.contentViewController = nil
-        hostingView = nil
+        // Keep the built panel for the next click; free it if it stays closed for a long time.
+        let closedAt = Date().timeIntervalSince1970
+        panelClosedAt = closedAt
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.panelCacheSeconds) { [weak self] in
+            guard let self, !self.isPanelOpen, self.panelClosedAt == closedAt else { return }
+            self.dropPanelCache()
+        }
         let previous = previousPanelApplication
         previousPanelApplication = nil
         let restoreFocus = restorePanelFocusOnClose
@@ -395,89 +434,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         performSilentAutoClean(reason: "内存 \(usedPct)%")
     }
 
-    // MARK: - 芯片框架图标 (内嵌居中数字)
-    private func renderChipFrameImage(percentage: Int, alert: Bool = false) -> NSImage {
-        let width: CGFloat = 25.0
-        let height: CGFloat = 22.0
-
-        let img = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
-            let bodyWidth: CGFloat = 19.5
-            let bodyHeight: CGFloat = 13.0
-            let bodyX: CGFloat = (width - bodyWidth) / 2.0
-            let bodyY: CGFloat = (height - bodyHeight) / 2.0
-
-            // 1. 芯片主体轮廓
-            let bodyRect = NSRect(x: bodyX, y: bodyY, width: bodyWidth, height: bodyHeight)
-            let bodyPath = NSBezierPath(roundedRect: bodyRect, xRadius: 2.8, yRadius: 2.8)
-            bodyPath.lineWidth = 1.2
-            NSColor.black.setStroke()
-            bodyPath.stroke()
-
-            // 2. 芯片四周引脚 (上下各 3 个金属引脚)
-            let pinW: CGFloat = 1.5
-            let pinH: CGFloat = 1.8
-            let pinSpacing: CGFloat = 4.3
-            let startX: CGFloat = bodyX + 3.4
-            for i in 0..<3 {
-                let px = startX + CGFloat(i) * pinSpacing
-                NSBezierPath(roundedRect: NSRect(x: px, y: bodyY + bodyHeight, width: pinW, height: pinH), xRadius: 0.5, yRadius: 0.5).fill()
-                NSBezierPath(roundedRect: NSRect(x: px, y: bodyY - pinH, width: pinW, height: pinH), xRadius: 0.5, yRadius: 0.5).fill()
-            }
-
-            // 3. 内部进度轻量填充
-            let pad: CGFloat = 1.6
-            let maxW = bodyWidth - (pad * 2)
-            let fillW = maxW * CGFloat(percentage) / 100.0
-            if fillW > 1.0 {
-                let fillRect = NSRect(x: bodyX + pad, y: bodyY + pad, width: fillW, height: bodyHeight - (pad * 2))
-                let fillPath = NSBezierPath(roundedRect: fillRect, xRadius: 1.6, yRadius: 1.6)
-                NSColor.black.withAlphaComponent(0.22).setFill()
-                fillPath.fill()
-            }
-
-            // 4. 居中数字
-            let text = "\(percentage)"
-            let fontSize: CGFloat = (percentage >= 100) ? 7.2 : 8.5
-            let font = NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .bold)
-            let pStyle = NSMutableParagraphStyle()
-            pStyle.alignment = .center
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: NSColor.black,
-                .paragraphStyle: pStyle
-            ]
-            let textSize = (text as NSString).size(withAttributes: attrs)
-            let textY = bodyY + (bodyHeight - textSize.height) / 2.0
-            let textRect = NSRect(x: bodyX, y: textY, width: bodyWidth, height: textSize.height)
-            text.draw(in: textRect, withAttributes: attrs)
-
-            // 5. 降智告警：右上角实心圆点（模板图只能单色，靠形状提示）
-            if alert {
-                let dot = NSRect(x: width - 7.5, y: height - 7.5, width: 7, height: 7)
-                NSColor.black.setFill()
-                NSBezierPath(ovalIn: dot).fill()
-            }
-            return true
-        }
-
-        img.isTemplate = true
-        return img
-    }
-
-    /// 图标仍然只画内存可用 %（不掺额度，免得菜单栏变成花的）。
-    /// 压力信号只走两条出口：越线弹通知 + 悬停 tooltip 里列全部。
+    /// The status item is the menu-bar pup (MenuBarPet). Quotas never draw there, so the bar stays calm;
+    /// pressure signals only go to threshold notifications and the hover tooltip.
     private func renderStatusButton(report: ScanReport) {
         evaluateExitChanges()
         guard let button = statusItem.button else { return }
         let health = NerfDetector.shared.snapshot()
         let alert = health.status == .alert
-        if lastStatusImage?.percentage != report.freePercentage || lastStatusImage?.alert != alert {
-            button.image = renderChipFrameImage(percentage: report.freePercentage, alert: alert)
-            button.imagePosition = .imageOnly
-            button.title = ""
-            button.attributedTitle = NSAttributedString(string: "")
-            lastStatusImage = (report.freePercentage, alert)
-        }
+        // Free memory appears beside the pup only when it is getting tight; the tooltip always has it.
+        petAlert = alert
+        petLabel = report.totalMemoryGB > 0 && report.freePercentage < 20 ? "\(report.freePercentage)%" : nil
+        pet?.update(cpu: (SystemMonitor.shared.latest.cpu ?? 0) * 100, alert: petAlert, label: petLabel)
 
         let signals = report.pressures
         var tip = ["VibeDeck · 内存可用 \(report.freePercentage)%", "模型健康：\(health.status.label) · \(health.headline)"]
@@ -702,6 +669,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         controller.preferredContentSize = hosting.frame.size
         panelPopover.contentViewController = controller
         panelPopover.contentSize = hosting.frame.size
+        cachedPanelKey = panelKey
 
     }
 

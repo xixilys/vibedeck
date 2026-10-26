@@ -66,6 +66,7 @@ for ARCH in ${ARCHS}; do
         Sources/FanServiceSelfTest.swift \
         Sources/PricingViews.swift \
         Sources/DashboardView.swift \
+        Sources/MenuBarPet.swift \
         Sources/AppDelegate.swift \
         Sources/main.swift \
         "${OUTPUT_DIR}/FanSMC-${ARCH}.o" \

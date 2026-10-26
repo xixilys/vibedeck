@@ -131,7 +131,9 @@ final class FanThermostat: ObservableObject {
     private convenience init() {
         let defaults = UserDefaults.standard
         let stored = defaults.double(forKey: Self.targetKey)
-        self.init(enabled: defaults.bool(forKey: Self.enabledKey), target: (55...95).contains(stored) ? stored : 80,
+        // Offline renders and self-tests start SystemMonitor too; they must never run a second fan loop.
+        let offline = CommandLine.arguments.contains("--render-panel") || CommandLine.arguments.contains("--selftest")
+        self.init(enabled: !offline && defaults.bool(forKey: Self.enabledKey), target: (55...95).contains(stored) ? stored : 80,
                   dependencies: Dependencies(
                     read: { _ = FanControl.shared.readSnapshot(completion: $0) },
                     manual: { FanControl.shared.applyManualCommand(rpm: $0, completion: $1) },

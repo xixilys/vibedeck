@@ -130,6 +130,70 @@ if CommandLine.arguments.contains("--debug-usage") {
 }
 
 // `VibeDeck --render-panel <目录>`：不开菜单，把各页面板渲染成 PNG（深色 / 浅色各一套），给 README 截图和界面检查用。
+// `VibeDeck --render-pet <dir>`: every pup pose at 8×, for reviewing the menu-bar artwork.
+if let i = CommandLine.arguments.firstIndex(of: "--render-pet") {
+    let dir = CommandLine.arguments.count > i + 1 ? CommandLine.arguments[i + 1] : "."
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    let poses: [(String, MenuBarPet.Pose, Bool, String?)] = [("run0", .run(0), false, nil), ("run1", .run(1), false, nil), ("run2", .run(2), false, nil),
+        ("run3", .run(3), false, nil), ("sit", .sit, false, nil), ("blink", .blink, false, nil), ("alert", .sit, true, nil), ("tight", .run(1), false, "14%")]
+    for (name, pose, alert, label) in poses {
+        let image = MenuBarPet.image(pose: pose, alert: alert, label: label)
+        let scale: CGFloat = 8
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(image.size.width * scale), pixelsHigh: Int(image.size.height * scale),
+                                   bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        rep.size = image.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSColor.white.setFill(); NSRect(origin: .zero, size: image.size).fill()
+        image.draw(in: NSRect(origin: .zero, size: image.size))
+        NSGraphicsContext.restoreGraphicsState()
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: "\(dir)/pet-\(name).png"))
+    }
+    print("pet poses → \(dir)")
+    exit(0)
+}
+
+// `VibeDeck --render-icon <png>`: the 1024 px app icon — the sitting pup, white on the brand gradient.
+if let i = CommandLine.arguments.firstIndex(of: "--render-icon") {
+    let path = CommandLine.arguments.count > i + 1 ? CommandLine.arguments[i + 1] : "AppIcon_1024.png"
+    let side = 1024
+    let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side, bitsPerSample: 8, samplesPerPixel: 4,
+                               hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    // macOS icon grid: 824 pt body inset 100 pt, continuous-looking corner.
+    let body = NSRect(x: 100, y: 100, width: 824, height: 824)
+    let shape = NSBezierPath(roundedRect: body, xRadius: 186, yRadius: 186)
+    NSGraphicsContext.saveGraphicsState()
+    let shadow = NSShadow(); shadow.shadowColor = NSColor.black.withAlphaComponent(0.28)
+    shadow.shadowBlurRadius = 28; shadow.shadowOffset = NSSize(width: 0, height: -12); shadow.set()
+    NSColor.black.setFill(); shape.fill()
+    NSGraphicsContext.restoreGraphicsState()
+    NSGradient(colors: [NSColor(red: 0.55, green: 0.38, blue: 1.0, alpha: 1), NSColor(red: 0.24, green: 0.56, blue: 1.0, alpha: 1)])!
+        .draw(in: shape, angle: -60)
+    // A soft glass highlight across the top.
+    NSGraphicsContext.saveGraphicsState()
+    shape.addClip()
+    NSGradient(colors: [NSColor.white.withAlphaComponent(0.26), NSColor.white.withAlphaComponent(0)])!
+        .draw(in: NSRect(x: body.minX, y: body.midY, width: body.width, height: body.height / 2), angle: -90)
+    NSGraphicsContext.restoreGraphicsState()
+    // The pup, tinted white, with a little ground shadow.
+    let pet = MenuBarPet.image(pose: .sit, alert: false, label: nil)
+    let tinted = NSImage(size: pet.size, flipped: false) { rect in
+        pet.draw(in: rect)
+        NSColor.white.set(); rect.fill(using: .sourceAtop)
+        return true
+    }
+    NSColor.black.withAlphaComponent(0.16).setFill()
+    NSBezierPath(ovalIn: NSRect(x: 300, y: 222, width: 440, height: 46)).fill()
+    let petRect = NSRect(x: 512 - 290, y: 236, width: 580, height: 580 * pet.size.height / pet.size.width)
+    tinted.draw(in: petRect)
+    NSGraphicsContext.restoreGraphicsState()
+    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+    print("icon → \(path)")
+    exit(0)
+}
+
 if let i = CommandLine.arguments.firstIndex(of: "--render-panel") {
     let dir = CommandLine.arguments.count > i + 1 ? CommandLine.arguments[i + 1] : "."
     _ = NSApplication.shared
@@ -187,9 +251,13 @@ if let i = CommandLine.arguments.firstIndex(of: "--render-panel") {
                 .environment(\.colorScheme, dark ? .dark : .light)
             MainActor.assumeIsolated {
                 // NSHostingView 离屏绘制：ImageRenderer 画不出分段 Picker / 按钮这类 AppKit 控件（会变成黄底禁止符号）
+                let started = CFAbsoluteTimeGetCurrent()
                 let host = NSHostingView(rootView: body)
                 host.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
                 let size = host.fittingSize
+                // Opening the panel builds this same tree; the first-layout cost is what the user waits for.
+                FileHandle.standardError.write(Data(String(format: "render %@ %@: %.0f ms\n", page.name, dark ? "dark" : "light",
+                                                           (CFAbsoluteTimeGetCurrent() - started) * 1000).utf8))
                 host.frame = NSRect(origin: .zero, size: size)
                 let win = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
                 win.contentView = host
@@ -943,7 +1011,48 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(DeviceScope.todayUsage(local: localRows, history: [:], scope: .all, historyReady: false).first { $0.name == "Codex" }?.ctx == 100)
         precondition(DeviceScope.todayUsage(local: localRows, history: today, scope: .remote("wsl"), historyReady: false).isEmpty)
         var grok = CLIUsage(name: "Grok"); grok.turns = 7; grok.note = "no token fields"
-        precondition(DeviceScope.todayUsage(local: [grok], history: today, scope: .all).first { $0.name == "Grok" }?.turns == 7)
+        // Grok now has per-turn usage history; the live turn-only row is replaced by it once history is ready.
+        precondition(DeviceScope.todayUsage(local: [grok], history: today, scope: .all, historyReady: false).first { $0.name == "Grok" }?.turns == 7)
+        var grokToday = today; grokToday["Grok · wsl"] = .init(ctx: 40, out: 4, turns: 2)
+        let grokRow = DeviceScope.todayUsage(local: [grok], history: grokToday, scope: .all).first { $0.name == "Grok" }
+        precondition(grokRow?.ctx == 40 && grokRow?.requests == 2, "Grok rows come from collected history")
+        do {
+            // GLM quota: unit 3 = hours (5h window), unit 6 = weeks.
+            let wire: [String: Any] = ["code": 200, "data": ["level": "pro", "limits": [
+                ["unit": 6, "number": 1, "percentage": 24, "nextResetTime": 1793181302976],
+                ["unit": 3, "number": 5, "percentage": 2, "nextResetTime": 1793037465914]]]]
+            let glm = ProcessScanner.parseGLMQuota(wire, key: "abcd1234", now: 1793022443)!
+            precondition(glm.tier == "Coding Pro" && glm.fiveHour?.usedPct == 2 && glm.fiveHour?.windowSeconds == 18000)
+            precondition(glm.weekly?.usedPct == 24 && glm.weekly?.windowSeconds == 604800 && glm.weekly?.resetsAt == 1793181302.976)
+            precondition(ProcessScanner.parseGLMQuota(["code": 401, "msg": "expired"], key: "k", now: 0) == nil)
+            // Grok usage.json → per-turn records with xAI's own cost.
+            let dir = NSTemporaryDirectory() + "vibedeck-grok-\(UUID().uuidString)"
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let usage = #"{"sessionId":"s1","turns":[{"turnNumber":1,"endedAt":"2026-10-26T10:34:27.549822720+00:00","inputTokens":17394,"outputTokens":39,"cachedReadTokens":1664,"cacheCreationTokens":0,"reasoningTokens":31,"costUsdTicks":110588400,"primaryModelId":"grok-4.7-build"}]}"#
+            FileManager.default.createFile(atPath: dir + "/usage.json", contents: Data(usage.utf8))
+            let turn = GrokUsage.records(path: dir + "/usage.json")["grok:s1:1"]!
+            precondition(turn.usage.ctx == 17394 && turn.usage.cacheRead == 1664 && turn.usage.out == 39 && turn.usage.think == 31)
+            precondition(abs(turn.billed!.value - 0.01105884) < 1e-9 && turn.billed!.currency == "USD" && turn.model == "grok-4.7-build")
+            precondition(abs(turn.timestamp - 1793010867.549) < 0.01)
+            // DSH ledger split by provider:model keeps DSH's own CNY cost; free relay models cost 0.
+            let ledger = #"{"days":{"2026-10-25":{"input":10,"output":2,"cacheRead":5,"byProviderModel":{"deepseek-official:deepseek-flash":{"input":8,"output":2,"cacheRead":5,"costCny":0.5},"magpie:opencode-zen-free/glm-5.3-flash-free":{"input":2,"output":0,"cacheRead":0,"costCny":0}}}}}"#
+            FileManager.default.createFile(atPath: dir + "/ledger.json", contents: Data(ledger.utf8))
+            let dsh = DSHUsage.read(path: dir + "/ledger.json", now: 1793022443)!.records
+            precondition(dsh.count == 2 && dsh["dsh:2026-10-25:deepseek-official:deepseek-flash"]?.billed == .init(value: 0.5, currency: "CNY"))
+            precondition(dsh["dsh:2026-10-25:magpie:opencode-zen-free/glm-5.3-flash-free"]?.model == "opencode-zen-free/glm-5.3-flash-free")
+            try? FileManager.default.removeItem(atPath: dir)
+            // Remote DSH / Grok records and their reported cost.
+            let remote = RemoteCollector.parseCLIRecords(jsonl: """
+            {"k":"dsh","id":"m1","t":1793018920.3,"m":"deepseek-flash","p":"magpie","in":5560,"cr":384,"cw":0,"out":95,"th":0,"s":"session-a"}
+            {"k":"dsh","id":"m2","t":1793018921.3,"m":"opencode-zen-free/x-free","in":10,"cr":0,"out":1,"c":0,"cur":"USD"}
+            {"k":"grok","id":"s1:1","t":1793010867.5,"m":"grok-4.7-build","in":17394,"cr":1664,"out":39,"th":31,"c":0.011,"cur":"USD"}
+            {"__ok__":true,"count":3,"max_mtime":1}
+            """, host: "wsl")
+            precondition(remote.ok && remote.records.count == 3)
+            precondition(remote.records.contains { $0.source == "DSH · wsl" && $0.id == "dsh:m1" && $0.billed == nil && $0.usage.ctx == 5560 })
+            precondition(remote.records.contains { $0.id == "dsh:m2" && $0.billed?.value == 0 })
+            precondition(remote.records.contains { $0.source == "Grok · wsl" && $0.billed?.value == 0.011 })
+        }
         var snapshot = UsageHistory.Snapshot()
         let midnight = Fmt.parseISODate("2026-10-01T16:00:00Z")!
         let timeZone = TimeZone(identifier: "Asia/Shanghai")!

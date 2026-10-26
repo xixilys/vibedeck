@@ -3,6 +3,24 @@ import Combine
 import SwiftUI
 import os
 
+/// Label for an inline picker: a small glass capsule instead of the native pull-down look.
+struct GlassChipLabel: View {
+    var icon: String
+    var text: String
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 9 * VG.scale, weight: .semibold)).foregroundStyle(.secondary)
+            Text(text).lineLimit(1).truncationMode(.middle)
+            Image(systemName: "chevron.up.chevron.down").font(.system(size: 7 * VG.scale, weight: .bold)).foregroundStyle(.tertiary)
+        }
+        .font(VG.font(11, .medium)).foregroundStyle(.primary)
+        .padding(.horizontal, 8).padding(.vertical, 3.5)
+        .background(Capsule().fill(Color.primary.opacity(0.07)))
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
+        .contentShape(Capsule())
+    }
+}
+
 struct MiniProgressBar: View {
     var value: Double
     var color: Color = .green
@@ -105,6 +123,7 @@ private struct MenuMaterial: NSViewRepresentable {
 extension Notification.Name {
     static let refreshVibeDeckPanel = Notification.Name("VibeDeck.refreshPanel")
     static let selectVibeDeckTab = Notification.Name("VibeDeck.selectTab")
+    static let vibeDeckPanelReopened = Notification.Name("VibeDeck.panelReopened")
 }
 
 struct SwipeScroll<Content: View>: NSViewRepresentable {
@@ -266,7 +285,7 @@ public enum DeviceScope: Equatable {
     /// 本机实时行仅在首次扫描前回退使用；API 代理不重复计入。
     static func todayUsage(local: [CLIUsage], history: [String: UsageHistory.Totals], scope: DeviceScope,
                            historyReady: Bool = true) -> [CLIUsage] {
-        let labels = ["Claude": "Claude Code", "Codex": "Codex", "OpenCode": "opencode", "DSH": "DSH"]
+        let labels = ["Claude": "Claude Code", "Codex": "Codex", "OpenCode": "opencode", "DSH": "DSH", "Grok": "Grok"]
         var rows: [CLIUsage]
         if case .remote = scope { rows = [] } else { rows = local }
         guard historyReady else { return rows }
@@ -775,6 +794,12 @@ public struct DashboardView: View {
             refreshLive()
         }
         .onReceive(NotificationCenter.default.publisher(for: .refreshVibeDeckPanel)) { _ in rescanAll() }
+        .onReceive(NotificationCenter.default.publisher(for: .vibeDeckPanelReopened)) { _ in
+            // A kept panel reopens on its top page with fresh snapshots, like a newly built one.
+            drillDown = nil
+            liveNow = Date()
+            refreshLive()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .selectVibeDeckTab)) { note in
             guard let selected = note.object as? Int, (0..<5).contains(selected) else { return }
             drillDown = nil
@@ -796,7 +821,9 @@ public struct DashboardView: View {
                     .keyboardShortcut("[", modifiers: .command)
                     Text(detailTitle(name)).font(VG.headline).lineLimit(1).truncationMode(.middle)
                 } else {
-                    Image(systemName: "gauge.with.dots.needle.67percent").font(VG.title)
+                    // The same pup as the menu bar, in the brand gradient.
+                    Image(nsImage: MenuBarPet.image(pose: .sit, alert: false, label: nil)).renderingMode(.template)
+                        .resizable().interpolation(.high).frame(width: 26 * VG.scale, height: 22 * VG.scale)
                         .foregroundStyle(LinearGradient(colors: [Glass.money, Glass.moneyEnd], startPoint: .topLeading, endPoint: .bottomTrailing))
                     Text("VibeDeck").font(.system(size: 14 * VG.scale, weight: .bold, design: .rounded))
                     if [1, 3, 4].contains(tab) { Text(L("本机", "Local")).font(VG.caption).foregroundStyle(.tertiary) }
@@ -1048,12 +1075,10 @@ public struct DashboardView: View {
                 }
             }
         } label: {
-            HStack(spacing: 3) {
-                Text(deviceScopeLabel).lineLimit(1).truncationMode(.middle)
-                Image(systemName: "chevron.down").font(.system(size: 8 * VG.scale, weight: .semibold))
-            }.font(VG.caption).foregroundStyle(.secondary)
+            GlassChipLabel(icon: deviceScope == .all ? "square.stack.3d.up" : isRemoteScope ? "server.rack" : "laptopcomputer",
+                           text: deviceScopeLabel)
         }
-        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize(horizontal: false, vertical: true)
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize(horizontal: false, vertical: true)
         .help(L("选择用量设备；账号额度保持合并", "Choose usage devices; account quotas stay merged"))
         .accessibilityIdentifier("usage.device")
         .onChange(of: deviceKey) { _, _ in actions.relayout() }
@@ -1145,7 +1170,8 @@ public struct DashboardView: View {
             }
             .padding(.horizontal, 2)
             AccountQuotaGrid(cards: visible, now: nowTS, unconfirmedIDs: pendingIDs, open: { openDetail("account:" + $0) })
-            APIQuotaSection(providers: currentAPI.providers, dshBalance: UsageHistory.dshBalance, now: nowTS,
+            APIQuotaSection(providers: currentAPI.providers, dshBalance: UsageHistory.dshBalance,
+                            plans: PlanQuota.collect(local: currentLLMs, remote: report.remoteLLMs, now: nowTS), now: nowTS,
                             openAPI: { if showAPITab { tab = 1 } else { openDetail(Self.apiPage) } })
             // Machine-state rows share one quiet style at the bottom: processes, then vitals.
             VStack(spacing: 5) {
@@ -1167,12 +1193,9 @@ public struct DashboardView: View {
                 }
             }
         } label: {
-            HStack(spacing: 3) {
-                Text(displayCurrency.label)
-                Image(systemName: "chevron.down").font(.system(size: 8 * VG.scale, weight: .semibold))
-            }.font(VG.caption).foregroundStyle(.secondary)
+            GlassChipLabel(icon: "dollarsign.arrow.circlepath", text: displayCurrency.label)
         }
-        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
         .accessibilityIdentifier("usage.currency")
         .help(exchangeRates.quote?.isUsable() == true ? L("参考汇率只改变显示，不改变原始费用", "Reference conversion changes display only") : L("没有可用参考汇率，保留原币金额", "No current reference rate; showing original currencies"))
     }
