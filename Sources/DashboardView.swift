@@ -1260,7 +1260,8 @@ public struct DashboardView: View {
     private func fullValueTexts(_ cards: [AccountPresentation]) -> [String: String] {
         var out: [String: String] = [:]
         // Baselines are at most 6 h old, so only recent points matter; deduplicate those once for every tile.
-        let recent = AccountUsage.deduplicated(history.accountUsage.points.filter { $0.timestamp >= nowTS - 7 * 3600 })
+        let cutoff = nowTS - 7 * 3600
+        let recent = AccountUsage.deduplicated(history.accountUsage.points.filter { $0.timestamp >= cutoff })
         for card in cards {
             let candidates = card.currentQuotas(at: nowTS).compactMap { q -> (AccountQuotaObservation, [String: Double])? in
                 AccountUsage.recentCapacity(q, points: recent).map { (q, $0) }
