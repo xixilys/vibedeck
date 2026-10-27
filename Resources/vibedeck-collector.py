@@ -1568,6 +1568,58 @@ def _grok_records(home, since_ms):
             out.append(rec)
     return out, max_m
 
+_CPA_DBS = ("/opt/cpa-usage-keeper/data/app.db", "~/cpa-usage-keeper/data/app.db", "~/.cpa-usage-keeper/data/app.db")
+_CPA_PROVIDERS = {"codex": "openai", "openai": "openai", "claude": "anthropic", "anthropic": "anthropic"}
+
+def _cpa_db(home):
+    override = os.environ.get("VIBEDECK_CPA_DB")
+    for raw in ([override] if override else []) + list(_CPA_DBS):
+        path = raw.replace("~", home, 1) if raw.startswith("~") else raw
+        if os.path.isfile(path) and os.access(path, os.R_OK):
+            return path
+    return None
+
+def _cpa_records(home, since_ms, now=None):
+    """CLIProxyAPI usage as kept by cpa-usage-keeper (SQLite, opened read-only): one record per request, with the
+    upstream account it used. Token fields follow Codex: input includes cached, output includes reasoning."""
+    path = _cpa_db(home)
+    if path is None:
+        return [], 0
+    import sqlite3
+    now = time.time() if now is None else now
+    max_m = max(_mtime_ms(path), _mtime_ms(path + "-wal"))
+    if max_m <= since_ms:
+        return [], max_m
+    # Keeper can file a request a little after it happened; an hour of overlap is deduplicated by id.
+    cutoff = max(since_ms / 1000.0 - 3600, now - _DSH_DAYS * 86400)
+    out = []
+    db = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=5)
+    try:
+        rows = db.execute("SELECT e.event_key, e.request_id, e.timestamp, e.model, e.provider, e.input_tokens, e.cached_tokens, "
+                          "e.cache_creation_tokens, e.output_tokens, e.reasoning_tokens, e.service_tier, i.account_id "
+                          "FROM usage_events e LEFT JOIN usage_identities i ON i.identity = e.auth_index")
+        for key, rid, stamp, model, provider, inp, cached, created, outp, reasoning, tier, account in rows:
+            t = _iso_epoch(stamp)
+            if t is None or t < cutoff:
+                continue
+            inp, outp = to_num(inp), to_num(outp)
+            if inp + outp <= 0:
+                continue
+            cr = min(to_num(cached), inp)
+            rec = {"k": "cpa", "id": to_str(key) or to_str(rid), "t": t, "m": to_str(model) or "?", "in": inp, "cr": cr,
+                   "cw": min(to_num(created), inp - cr), "out": outp, "th": min(to_num(reasoning), outp)}
+            if not rec["id"]:
+                continue
+            if tier in ("priority", "flex"):
+                rec["tier"] = tier
+            account_provider = _CPA_PROVIDERS.get((to_str(provider) or "").lower())
+            if account_provider and to_str(account):
+                rec["account_provider"], rec["account_id"] = account_provider, to_str(account)
+            out.append(rec)
+    finally:
+        db.close()
+    return out, max_m
+
 def collect_records(home, since_ms, include_metadata=False, include_identity_backfill=False, tools_since_ms=None):
     """返回 (记录列表, 最大 mtime 毫秒)。只看 mtime > since_ms 的文件。"""
     out, max_m = [], 0
@@ -1635,7 +1687,7 @@ def collect_records(home, since_ms, include_metadata=False, include_identity_bac
                 if account: out.append(dict(account, k="account_session", cli="codex", s=os.path.basename(p)))
             continue
         out.extend(_codex_file_records(p, include_metadata=include_metadata))
-    for collect in (_dsh_records, _grok_records):
+    for collect in (_dsh_records, _grok_records, _cpa_records):
         try:
             recs, newest = collect(home, since_ms if tools_since_ms is None else tools_since_ms)
         except Exception:
@@ -1649,7 +1701,7 @@ def run_records(since, gz, include_identity_backfill=False, tools_since=None):
         recs, max_m = collect_records(os.path.expanduser("~"), since, include_metadata=True, include_identity_backfill=include_identity_backfill,
                                       tools_since_ms=tools_since)
         lines = [json.dumps(r, separators=(",", ":")) for r in recs]
-        lines.append(json.dumps({"__ok__": True, "count": sum(r.get("k") in ("claude", "codex", "dsh", "grok") for r in recs), "max_mtime": max_m}, separators=(",", ":")))
+        lines.append(json.dumps({"__ok__": True, "count": sum(r.get("k") in ("claude", "codex", "dsh", "grok", "cpa") for r in recs), "max_mtime": max_m}, separators=(",", ":")))
         text = "\n".join(lines) + "\n"
         if gz:
             co = zlib.compressobj(6, zlib.DEFLATED, -15)     # 原始 DEFLATE，Mac 端用 Foundation 直接解
@@ -1913,6 +1965,27 @@ def _presence_selftest(tmp):
     finally:
         globals()["_presence_status"], globals()["_presence_executable"], json.loads = saved_status, saved_executable, saved_loads
 
+def _cpa_selftest(tmp):
+    import sqlite3
+    path = os.path.join(tmp, "cpa.db")
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE usage_events (event_key text, request_id text, timestamp text, model text, provider text, auth_index text, "
+               "input_tokens int, cached_tokens int, cache_creation_tokens int, output_tokens int, reasoning_tokens int, service_tier text)")
+    db.execute("CREATE TABLE usage_identities (identity text, account_id text)")
+    db.execute("INSERT INTO usage_identities VALUES ('auth-1', 'ACCOUNT-CPA')")
+    db.execute("INSERT INTO usage_events VALUES ('ev-1', 'r1', '2026-10-27T12:56:20.5+08:00', 'gpt-6.1-sol', 'codex', 'auth-1', 1000, 900, 0, 50, 20, 'auto')")
+    db.execute("INSERT INTO usage_events VALUES ('ev-2', 'r2', '2026-10-27T12:57:00+08:00', 'gpt-6.1-sol', 'codex', 'other', 0, 0, 0, 0, 0, 'auto')")
+    db.commit(); db.close()
+    os.environ["VIBEDECK_CPA_DB"] = path
+    try:
+        recs, newest = _cpa_records(tmp, 0, now=_iso_epoch("2026-10-27T13:00:00+08:00"))
+    finally:
+        del os.environ["VIBEDECK_CPA_DB"]
+    assert newest > 0 and len(recs) == 1, recs
+    r = recs[0]
+    assert r["k"] == "cpa" and r["id"] == "ev-1" and r["in"] == 1000 and r["cr"] == 900 and r["out"] == 50 and r["th"] == 20
+    assert r["account_provider"] == "openai" and r["account_id"] == "ACCOUNT-CPA" and "tier" not in r
+
 def selftest():
     global _session_counts, collect_platform_quotas
     import tempfile, shutil, contextlib, io
@@ -1920,6 +1993,7 @@ def selftest():
     try:
         _presence_selftest(tmp)
         _process_selftest(tmp)
+        _cpa_selftest(tmp)
         def w(rel, rows):
             p = os.path.join(tmp, rel)
             if not os.path.isdir(os.path.dirname(p)):

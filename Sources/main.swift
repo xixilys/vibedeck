@@ -232,7 +232,8 @@ if let i = CommandLine.arguments.firstIndex(of: "--render-panel") {
     let savedArguments = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
     let pages: [(name: String, tab: Int, drill: String?)] = [("subscription", 0, nil), ("api", 1, nil), ("stats", 2, nil),
                                                              ("network", 3, nil), ("system", 4, nil), ("health", 0, DashboardView.healthPage),
-                                                             ("prices", 0, DashboardView.pricesPage), ("settings", 0, DashboardView.settingsPage)]
+                                                             ("prices", 0, DashboardView.pricesPage), ("settings", 0, DashboardView.settingsPage),
+                                                             ("devices", 0, DashboardView.devicesPage)]
         + AccountPresentation.cards(usage: UsageHistory.shared.snapshot().accountUsage, quotas: AccountUsage.quotaObservations(report: report),
                                     now: Date().timeIntervalSince1970)
             .filter { $0.account != nil }.prefix(2).enumerated().map { ("account\($0.offset)", 0, "account:" + $0.element.id) }

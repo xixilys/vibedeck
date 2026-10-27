@@ -255,7 +255,7 @@ enum RemoteCollector {
                     milliseconds: milliseconds, startedAt: epoch(o["started_at"]), model: model, account: account, failed: failed))
                 continue
             }
-            let labels = ["claude": "Claude", "codex": "Codex", "dsh": "DSH", "grok": "Grok"]
+            let labels = ["claude": "Claude", "codex": "Codex", "dsh": "DSH", "grok": "Grok", "cpa": "CPA"]
             guard let kind = o["k"] as? String, let label = labels[kind],
                   let id = o["id"] as? String, !id.isEmpty,
                   let t = epoch(o["t"]) else { continue }

@@ -139,6 +139,9 @@ public struct QuotaWindow: Equatable {
     /// 近期速度（本工具自己记的额度采样算出来的，%/小时）。0 = 还没攒够样本
     public var recentPctPerHour: Double = 0
     public var recentSpanMinutes: Int = 0
+    /// Oldest sample kept for this same window (≤ 6 h): the baseline for estimating what the full quota is worth.
+    public var baselineAt: TimeInterval? = nil
+    public var baselinePct: Int? = nil
     /// Keep fractional provider measurements for equivalent-USD capacity, without changing rounded UI labels.
     public var rawUsedPercent: Double? = nil
     public var accountingUsedPercent: Double { rawUsedPercent ?? Double(usedPct) }
@@ -1176,6 +1179,11 @@ public final class ProcessScanner {
         report.remoteHosts = RemoteCollector.devices()
         remoteLock.lock()
         report.remoteLLMs = remoteLLMs.filter { report.remoteHosts.contains($0.key) }
+        // Remote quotas get the same sample history as local ones (keyed by host), for pace and full-value estimates.
+        let sampledAt = Date().timeIntervalSince1970
+        for (host, list) in report.remoteLLMs {
+            report.remoteLLMs[host] = list.map { var l = $0; sampleLLMQuotas(&l, now: sampledAt, host: host); return l }
+        }
         report.remoteDeviceStatus = remoteDeviceStatus.filter { report.remoteHosts.contains($0.key) }
         // Start with this local snapshot, then bind remote rows to the registered host.
         // No stale remote inventory survives a failed/legacy summary response.
@@ -3094,6 +3102,7 @@ public final class ProcessScanner {
             // 键会随窗口重置而变，老键留着没用 —— 顺手清掉超过保留期的整条
             qsamples = qsamples.filter { !($0.value.last.map { now - $0.t > Self.sampleKeep } ?? true) }
         }
+        if let first = arr.first, now - first.t >= 600 { w.baselineAt = first.t; w.baselinePct = first.pct }
         // 近 1 小时内最老的样本 → 两点差。跨度不足 10 分钟就不算（噪声太大）
         guard let oldest = arr.first(where: { now - $0.t <= 3600 }) else { return }
         let spanSec = now - oldest.t
@@ -3105,11 +3114,12 @@ public final class ProcessScanner {
     }
 
     /// 给一个平台的所有额度窗口记样本（在 scanActiveLLMs 末尾统一做，卡片与详情页都能拿到）
-    private func sampleLLMQuotas(_ llm: inout DetectedLLMRuntime, now: TimeInterval) {
-        if llm.fiveHour != nil { sampleAndFill(&llm.fiveHour!, key: "\(llm.name)|5h", now: now) }
-        if llm.sevenDay != nil { sampleAndFill(&llm.sevenDay!, key: "\(llm.name)|w", now: now) }
-        if llm.secondaryFiveHour != nil { sampleAndFill(&llm.secondaryFiveHour!, key: "\(llm.name)|sec5h", now: now) }
-        if llm.secondarySevenDay != nil { sampleAndFill(&llm.secondarySevenDay!, key: "\(llm.name)|secw", now: now) }
+    private func sampleLLMQuotas(_ llm: inout DetectedLLMRuntime, now: TimeInterval, host: String? = nil) {
+        let name = host.map { "\($0)|\(llm.name)" } ?? llm.name
+        if llm.fiveHour != nil { sampleAndFill(&llm.fiveHour!, key: "\(name)|5h", now: now) }
+        if llm.sevenDay != nil { sampleAndFill(&llm.sevenDay!, key: "\(name)|w", now: now) }
+        if llm.secondaryFiveHour != nil { sampleAndFill(&llm.secondaryFiveHour!, key: "\(name)|sec5h", now: now) }
+        if llm.secondarySevenDay != nil { sampleAndFill(&llm.secondarySevenDay!, key: "\(name)|secw", now: now) }
     }
 
     // MARK: 记账覆盖体检（哪些 BASE_URL 没走代理）

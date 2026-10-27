@@ -356,6 +356,8 @@ struct AccountQuotaGrid: View {
     let now: TimeInterval
     /// Recent quota holders whose sign-in is not confirmed right now; drawn dimmed with a "待确认" mark.
     var unconfirmedIDs: Set<String> = []
+    /// Estimated full-quota value per card ("≈ $410 / wk"), already formatted in the display currency.
+    var fullValue: [String: String] = [:]
     var open: (String) -> Void
 
     private let columns = [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)]
@@ -448,7 +450,19 @@ struct AccountQuotaGrid: View {
                           + (QuotaPresentation.compactReset(to: q.resetAt, now: now).map { L("重置 ", "resets ") + $0 } ?? L("重置未知", "Reset unknown"))
                           + (fresh(q) ? "" : "\n" + L("旧采样", "Older sample")))
                 }
-                if shown.isEmpty { Text(L("额度 —", "Quota —")).font(VG.caption).foregroundStyle(.secondary) }
+                if shown.isEmpty {
+                    Text(card.planTitle == nil ? L("额度 —", "Quota —") : L("额度暂不可读", "Quota not readable"))
+                        .font(VG.caption).foregroundStyle(.secondary)
+                }
+                if let value = fullValue[card.id] {
+                    HStack(spacing: 2) {
+                        Image(systemName: "equal.circle").font(.system(size: 8.5 * VG.scale, weight: .semibold))
+                        Text(L("满额 ", "Full ") + value)
+                    }
+                    .font(VG.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.85)
+                    .help(L("按最近的用量折算：这段时间按 API 价花了多少 ÷ 额度涨了几个百分点。是估算，不是官方数字。",
+                            "From recent usage: API-priced spend in this stretch ÷ the percentage points it used. An estimate, not an official figure."))
+                }
                 if selection.additionalCount > 0 {
                     Text(L("+\(selection.additionalCount) · 详情", "+\(selection.additionalCount) · Details"))
                         .font(VG.caption).foregroundStyle(.secondary)
@@ -465,7 +479,7 @@ struct AccountQuotaGrid: View {
     private func accountLabel(_ label: String, card: AccountPresentation) -> some View {
         HStack(spacing: 3) {
             Text(label).font(VG.font(12, .semibold)).lineLimit(1).truncationMode(.middle).help(card.title)
-            if card.account == nil {
+            if card.account == nil && card.planTitle == nil {
                 Image(systemName: "questionmark.circle").font(VG.caption).foregroundStyle(.secondary)
                     .help(L("账号未验证，未与其他设备合并", "Unverified account; not merged across devices"))
             }
@@ -491,7 +505,8 @@ struct AccountQuotaGrid: View {
         case "Claude": return "sparkle"
         case "Codex": return "chevron.left.forwardslash.chevron.right"
         case "Grok": return "bolt"
-        case "Gemini": return "diamond"
+        case "Gemini", "Antigravity": return "diamond"
+        case "GLM": return "circle.hexagongrid"
         case "OpenCode", "opencode": return "terminal"
         default: return "person.crop.circle"
         }
@@ -509,6 +524,7 @@ enum Brand {
         case "deepseek", "dsh": return Color(red: 0.30, green: 0.42, blue: 1.0)
         case "opencode", "opencode go": return Color(red: 0.96, green: 0.62, blue: 0.14)
         case "grok", "xai": return Color.primary.opacity(0.78)
+        case "cpa": return Color(red: 0.93, green: 0.36, blue: 0.55)
         case "gemini", "google": return Color(red: 0.26, green: 0.52, blue: 0.96)
         case "kimi", "moonshot": return Color(red: 0.55, green: 0.40, blue: 0.95)
         case "glm", "zhipu", "z.ai": return Color(red: 0.20, green: 0.55, blue: 0.95)
@@ -679,19 +695,31 @@ struct PlanQuota: Identifiable {
     var title: String
     var detail: String
     var bars: [Bar]
+    /// The runtime name to open for details, and its windows as quota observations for the ring tile.
+    var runtimeName: String = ""
+    var source: String = ""
+    var observations: [AccountQuotaObservation] = []
+
+    /// Ring-tile form, so subscription plans sit next to signed-in accounts instead of among API keys.
+    var card: AccountPresentation {
+        var card = AccountPresentation(id: "plan:" + id, account: nil, usage: nil, quotas: observations)
+        card.planTitle = title
+        card.signedInSources = [source]
+        return card
+    }
 
     static func collect(local: [DetectedLLMRuntime], remote: [String: [DetectedLLMRuntime]], now: TimeInterval) -> [PlanQuota] {
         let names = ["Grok": "Grok", "GLM": "GLM", "Gemini": "Gemini", "Antigravity": "Gemini"]
-        var best: [String: (runtime: DetectedLLMRuntime, device: String, captured: TimeInterval)] = [:]
-        let candidates = local.map { ($0, L("本机", "Local")) }
-            + remote.sorted { $0.key < $1.key }.flatMap { host, list in list.map { ($0, RemoteCollector.displayName(for: host)) } }
-        for (runtime, device) in candidates {
+        var best: [String: (runtime: DetectedLLMRuntime, device: String, captured: TimeInterval, host: String?)] = [:]
+        let candidates: [(DetectedLLMRuntime, String, String?)] = local.map { ($0, L("本机", "Local"), nil) }
+            + remote.sorted { $0.key < $1.key }.flatMap { host, list in list.map { ($0, RemoteCollector.displayName(for: host), host) } }
+        for (runtime, device, host) in candidates {
             guard let brand = names[runtime.name] else { continue }
             let key = brand + ":" + (runtime.planKey ?? "")
             let windows = [runtime.fiveHour, runtime.sevenDay, runtime.secondaryFiveHour, runtime.secondarySevenDay].compactMap { $0 }
             let captured = windows.compactMap(\.capturedAt).max() ?? (windows.isEmpty ? -1 : 0)
             if let current = best[key], current.captured >= captured { continue }
-            best[key] = (runtime, device, captured)
+            best[key] = (runtime, device, captured, host)
         }
         return best.map { key, entry in
             let r = entry.runtime, brand = names[r.name] ?? r.name
@@ -703,11 +731,25 @@ struct PlanQuota: Identifiable {
             let bars = [bar("5h", r.fiveHour), bar(L("周", "Week"), r.sevenDay),
                         bar(secondary + "5h", r.secondaryFiveHour), bar(secondary + L("周", "Week"), r.secondarySevenDay)].compactMap { $0 }
             let tier = ["已登录", "未登录", "Unknown", ""].contains(r.tier) ? "" : r.tier
-            let title = brand == "GLM" ? "GLM " + (tier.isEmpty ? "Coding Plan" : tier) : tier.isEmpty ? brand : brand + " · " + tier
+            let title = brand + " · " + (tier.isEmpty ? (brand == "GLM" ? "Coding Plan" : L("订阅", "Plan")) : tier.replacingOccurrences(of: brand + " ", with: ""))
+            let source = r.name + (entry.host.map { " · " + $0 } ?? "")
+            let pool = brand.lowercased()
+            func observation(_ w: QuotaWindow?, _ window: String, pool: String) -> AccountQuotaObservation? {
+                guard let w, let captured = w.capturedAt, !w.isExpired(now: now) else { return nil }
+                return AccountQuotaObservation(account: nil, source: source, provider: pool, pool: pool, window: window,
+                    startedAt: w.windowSeconds > 0 ? w.resetsAt.map { $0 - w.windowSeconds } : nil, resetAt: w.resetsAt,
+                    capturedAt: captured, usedPercent: w.accountingUsedPercent, trusted: now - captured <= 600,
+                    baselineAt: w.baselineAt, baselinePercent: w.baselinePct.map(Double.init))
+            }
+            let secondaryPool = pool + ":" + r.secondaryPoolName.lowercased()
+            let observations = [observation(r.fiveHour, "5h", pool: pool), observation(r.sevenDay, "week", pool: pool),
+                                observation(r.secondaryFiveHour, "5h", pool: secondaryPool),
+                                observation(r.secondarySevenDay, "week", pool: secondaryPool)].compactMap { $0 }
             var detail = entry.device
             if entry.captured > 0 { detail += " · " + UIFormat.agoShort(max(0, Int(now - entry.captured))) }
             if bars.isEmpty { detail = entry.device + " · " + L("额度暂不可读", "quota not readable") }
-            return PlanQuota(id: key, brand: brand, title: title, detail: detail, bars: bars)
+            return PlanQuota(id: key, brand: brand, title: title, detail: detail, bars: bars,
+                             runtimeName: r.name, source: source, observations: observations)
         }.sorted { a, b in
             let order = ["Grok", "GLM", "Gemini"]
             return (order.firstIndex(of: a.brand) ?? 9, a.id) < (order.firstIndex(of: b.brand) ?? 9, b.id)
@@ -744,12 +786,8 @@ struct APIQuotaSection: View {
     }
 
     var rows: [Row] {
-        var out: [Row] = plans.map { plan in
-            let tightest = plan.bars.map(\.used).max()  // the bars carry the numbers; only "—" marks a missing quota
-            return Row(id: "plan:" + plan.id, brand: plan.brand, title: plan.title, detail: plan.detail,
-                       value: tightest == nil ? "—" : "", fraction: nil, bars: plan.bars)
-        }
-        // A proxied key for the same plan would show twice; the plan row (with real quota) wins.
+        var out: [Row] = []
+        // Subscription plans are ring tiles above; a proxied key for the same plan would show it twice.
         let planBrands = Set(plans.filter { !$0.bars.isEmpty }.map(\.brand))
         if let balance = dshBalance {
             out.append(Row(id: "dsh", brand: "DeepSeek", title: "DeepSeek API",
@@ -780,10 +818,10 @@ struct APIQuotaSection: View {
         let list = rows
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Text(L("API 与套餐", "API & plans")).font(VG.caption.weight(.semibold)).foregroundStyle(.secondary)
-                VGInfoButton(title: L("API 与套餐", "API & plans"),
-                             text: L("Grok / GLM / Gemini 套餐取各设备里最近一次读到的额度（GLM 按 key 指纹合并），条表示已用；Gemini 目前没有可读的额度接口时如实显示「暂不可读」。DeepSeek 余额来自 DSH 记账插件最后一次读到的值。经本机记账代理的 API key / Coding Plan（如 GLM、Kimi、OpenCode Go）显示额度或调用数；没有用量接口的套餐可在 ~/.config/vibedeck/plans.json 填写上限，按请求数估算。",
-                                     "Grok / GLM / Gemini plans use the most recent quota read on any device (GLM merged by key fingerprint); bars show usage. Gemini shows “not readable” while no quota source is available. The DeepSeek balance is the value DSH’s cost meter last read. API keys and coding plans routed through the local proxy (GLM, Kimi, OpenCode Go…) show their quota or request count; plans without a usage API can be estimated from request counts via ~/.config/vibedeck/plans.json."))
+                Text(L("API 与余额", "API & balances")).font(VG.caption.weight(.semibold)).foregroundStyle(.secondary)
+                VGInfoButton(title: L("API 与余额", "API & balances"),
+                             text: L("Grok / GLM / Gemini 是订阅，显示在上方订阅卡里。DeepSeek 余额来自 DSH 记账插件最后一次读到的值。经本机记账代理的 API key / Coding Plan（如 GLM、Kimi、OpenCode Go）显示额度或调用数；没有用量接口的套餐可在 ~/.config/vibedeck/plans.json 填写上限，按请求数估算。",
+                                     "Grok / GLM / Gemini are subscriptions and appear in the subscription tiles above. The DeepSeek balance is the value DSH’s cost meter last read. API keys and coding plans routed through the local proxy (GLM, Kimi, OpenCode Go…) show their quota or request count; plans without a usage API can be estimated from request counts via ~/.config/vibedeck/plans.json."))
                 Spacer()
                 Button(action: openAPI) {
                     HStack(spacing: 3) { Text(L("管理", "Manage")); Image(systemName: "chevron.right") }

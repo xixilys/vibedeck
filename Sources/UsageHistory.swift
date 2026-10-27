@@ -127,6 +127,10 @@ public final class UsageHistory {
 
     /// 经记账代理的上游（"API · GLM" 这类）：同一请求多半已在 CLI 日志里，不进总数
     public static func isProxySource(_ source: String) -> Bool { source.hasPrefix("API") }
+    /// Accounting plane: the local proxy, a CLIProxyAPI relay, or the CLI's own logs. Planes may overlap and are never added.
+    static func origin(of source: String) -> String {
+        isProxySource(source) ? "proxy" : cli(of: source) == "CPA" ? "cpa" : "cli"
+    }
 
     /// 来源属于哪台设备：`X · <设备>` 的后缀；本机来源没有后缀（API 记账也算本机）。
     public static func device(of source: String) -> String? {
@@ -1194,7 +1198,7 @@ public final class UsageHistory {
             let since = !metadataBackfill && cli.timingFetched == true ? incrementalSince : min(incrementalSince, Int64((now - 86400) * 1000))
             // DSH / Grok records arrived after the Claude/Codex cursor; pull their history once, then follow the cursor.
             switch RemoteCollector.pullCLIRecords(host: host, since: since, includeIdentityBackfill: metadataBackfill,
-                                                  toolsSince: cli.toolsVersion == 1 ? nil : 0) {
+                                                  toolsSince: cli.toolsVersion == 2 ? nil : 0) {
             case .failure(let error):
                 remoteCLIStatus[host] = error.message
                 log.notice("remote cli \(host, privacy: .public) 未连上：\(error.message, privacy: .public)")
@@ -1202,7 +1206,7 @@ public final class UsageHistory {
                 remoteCLIStatus[host] = nil
                 cli.timingFetched = true
                 cli.metadataVersion = 1
-                cli.toolsVersion = 1
+                cli.toolsVersion = 2
                 if !pull.turnLatencies.isEmpty { cli.turnLatencies = Self.mergedTurnLatencies((cli.turnLatencies ?? []) + pull.turnLatencies, now: now) }
                 if !pull.sessionAccounts.isEmpty {
                     for id in cli.records.keys {
@@ -1955,7 +1959,7 @@ public final class UsageHistory {
                 account: bucket.account, pool: AccountUsage.pool(model: bucket.model, source: bucket.source), usage: bucket.usage,
                 requests: bucket.turns, equivalentCostByCurrency: cost.map { [$0.currency: $0.value] } ?? [:],
                 unpricedRequests: cost == nil ? bucket.turns : 0, exactRequestID: bucket.exactRequestID,
-                origin: Self.isProxySource(bucket.source) ? "proxy" : "cli", timestampResolution: bucket.exactRequestID == nil && bucket.timestamp < now - Self.forecastWindow ? 3600 : 0))
+                origin: Self.origin(of: bucket.source), timestampResolution: bucket.exactRequestID == nil && bucket.timestamp < now - Self.forecastWindow ? 3600 : 0))
         }
         for record in state.records.values {
             let day = dayKeys.key(record.timestamp)
@@ -1971,7 +1975,7 @@ public final class UsageHistory {
                 account: record.account, pool: AccountUsage.pool(model: record.model, source: record.source), usage: u,
                 requests: 1, equivalentCostByCurrency: equivalent.map { [$0.currency: $0.value] } ?? [:],
                 unpricedRequests: equivalent == nil ? 1 : 0, exactRequestID: AccountUsage.exactRequestID(record.id, source: record.source),
-                origin: Self.isProxySource(record.source) ? "proxy" : "cli"))
+                origin: Self.origin(of: record.source)))
             let modelDay = dayKeys.key(record.timestamp)
             f.models[modelDay, default: [:]][record.source, default: [:]][record.model, default: PerformanceTotals()].add(record)
             if record.timestamp >= now - 86400 {

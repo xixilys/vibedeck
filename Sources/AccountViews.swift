@@ -7,8 +7,11 @@ struct AccountPresentation: Identifiable {
     var quotas: [AccountQuotaObservation]
     /// Current signed-in device sources; historical observations do not inflate this list.
     var signedInSources: [String] = []
+    /// Subscription plans without a sign-in identity (Grok, GLM, Gemini) carry their own "Tool · Plan" title.
+    var planTitle: String? = nil
 
     var title: String {
+        if let planTitle { return planTitle }
         let provider = account?.provider ?? quotas.first?.provider ?? ""
         let tool = provider == "openai" ? "Codex" : provider == "anthropic" ? "Claude" : provider.capitalized
         if let label = account?.displayLabel, !label.isEmpty { return tool + " · " + label }

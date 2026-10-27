@@ -120,12 +120,17 @@ public struct AccountQuotaObservation: Codable, Equatable, Identifiable {
     public var trusted: Bool
     /// Devices/tools whose quota snapshots identify this same account/window. Never attributes their usage.
     public var associatedSources: [String]? = nil
+    /// Oldest sampled reading of this same window (see QuotaWindow.baselineAt), for recent full-value estimates.
+    public var baselineAt: TimeInterval? = nil
+    public var baselinePercent: Double? = nil
     public init(account: AccountIdentity?, source: String, provider: String, pool: String, window: String,
                 startedAt: TimeInterval? = nil, resetAt: TimeInterval? = nil, capturedAt: TimeInterval,
-                usedPercent: Double, trusted: Bool = true, associatedSources: [String]? = nil) {
+                usedPercent: Double, trusted: Bool = true, associatedSources: [String]? = nil,
+                baselineAt: TimeInterval? = nil, baselinePercent: Double? = nil) {
         self.account = account; self.source = source; self.provider = provider; self.pool = pool; self.window = window
         self.startedAt = startedAt; self.resetAt = resetAt; self.capturedAt = capturedAt
         self.usedPercent = usedPercent; self.trusted = trusted; self.associatedSources = associatedSources
+        self.baselineAt = baselineAt; self.baselinePercent = baselinePercent
     }
     public var id: String {
         [account?.key ?? "unassigned:" + source, provider, pool, window,
@@ -152,6 +157,8 @@ public enum AccountUsage {
         if CostEngine.isSubscriptionIncluded(model) { return "chatgpt-web" }
         let tool = UsageHistory.cli(of: source).lowercased()
         if tool == "codex" { return "codex" }
+        // A CLIProxyAPI relay spends the same pools as the CLIs whose accounts it holds.
+        if tool == "cpa" { return model.lowercased().contains("claude") ? "claude" : "codex" }
         if tool == "claude" { return "claude" }
         return tool
     }
@@ -230,6 +237,28 @@ public enum AccountUsage {
               let usd = result.consumedAsOfCapture.equivalentCostByCurrency["USD"], usd.isFinite, usd >= 0 else { return result }
         result.capacityUSD = usd / (q.usedPercent / 100)
         return result
+    }
+
+    /// sub2api-style full-value estimate: what the requests made since the window's baseline sample cost at
+    /// API prices, divided by how many percent they used. Needs ≥ 3 points of movement over ≥ 15 minutes,
+    /// so one rounding step can't swing it wildly. Original currencies are kept.
+    public static func recentCapacity(_ q: AccountQuotaObservation, points: [AccountUsagePoint]) -> [String: Double]? {
+        guard let start = q.baselineAt, let base = q.baselinePercent, start.isFinite, q.capturedAt - start >= 900,
+              q.usedPercent.isFinite else { return nil }
+        let delta = q.usedPercent - base
+        guard delta >= 3 else { return nil }
+        var spent: [String: Double] = [:]
+        for point in deduplicated(points) where point.origin == "cli" && point.timestamp > start && point.timestamp <= q.capturedAt {
+            let matches: Bool
+            if let account = q.account { matches = point.account == account && point.pool == q.pool }
+            // A coding plan's key is shared by every tool and device that calls its models.
+            else if q.pool == "glm" { matches = point.model.lowercased().contains("glm") }
+            else { matches = point.account == nil && UsageHistory.cli(of: point.source).lowercased() == q.pool }
+            guard matches else { continue }
+            for (currency, value) in point.equivalentCostByCurrency where value.isFinite { spent[currency, default: 0] += value }
+        }
+        guard spent.values.reduce(0, +) > 0 else { return nil }
+        return spent.mapValues { $0 / (delta / 100) }
     }
 
     public static func mergedQuotas(_ observations: [AccountQuotaObservation]) -> [AccountQuotaObservation] {
@@ -334,6 +363,10 @@ public enum AccountUsage {
                                         startedAt: 100, resetAt: 300, capturedAt: 200, usedPercent: 30)
         precondition(cycle(observation: q, points: [p], coverageStart: 100, now: 210).capacityUSD == 400)
         precondition(cycle(observation: q, points: [p], now: 210).capacityUSD == nil)
+        var sampled = q; sampled.capturedAt = 2000; sampled.baselineAt = 100; sampled.baselinePercent = 10
+        precondition(recentCapacity(sampled, points: [p]) == ["USD": 600], "$120 for 20 points → $600 full")
+        sampled.baselinePercent = 28
+        precondition(recentCapacity(sampled, points: [p]) == nil, "under 3 points of movement is too noisy")
         var future = p; future.timestamp = 201; future.exactRequestID = "resp_future"
         let afterCapture = cycle(observation: q, points: [p, future], coverageStart: 100, now: 210)
         precondition(afterCapture.capacityUSD == 400 && afterCapture.consumedAsOfCapture.equivalentCostByCurrency["USD"] == 120)
@@ -508,7 +541,8 @@ public extension AccountUsage {
                     provider: account?.provider ?? (lower.contains("codex") ? "openai" : lower.contains("claude") ? "anthropic" : lower),
                     pool: pool, window: window, startedAt: start, resetAt: quota.resetsAt,
                     capturedAt: captured, usedPercent: quota.accountingUsedPercent, trusted: quotaTrusted(quota, runtime: runtime,
-                        status: host.flatMap { report.remoteDeviceStatus[$0] }, isRemote: host != nil, now: now)))
+                        status: host.flatMap { report.remoteDeviceStatus[$0] }, isRemote: host != nil, now: now),
+                    baselineAt: quota.baselineAt, baselinePercent: quota.baselinePct.map(Double.init)))
             }
             append(runtime.fiveHour, window: "5h", account: runtime.account, pool: pool)
             append(runtime.sevenDay, window: "week", account: runtime.account, pool: pool)

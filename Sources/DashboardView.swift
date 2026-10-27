@@ -7,9 +7,10 @@ import os
 struct GlassChipLabel: View {
     var icon: String
     var text: String
+    var tint: Color? = nil
     var body: some View {
         HStack(spacing: 4) {
-            Image(systemName: icon).font(.system(size: 9 * VG.scale, weight: .semibold)).foregroundStyle(.secondary)
+            Image(systemName: icon).font(.system(size: 9 * VG.scale, weight: .semibold)).foregroundStyle(tint ?? .secondary)
             Text(text).lineLimit(1).truncationMode(.middle)
             Image(systemName: "chevron.up.chevron.down").font(.system(size: 7 * VG.scale, weight: .bold)).foregroundStyle(.tertiary)
         }
@@ -285,7 +286,7 @@ public enum DeviceScope: Equatable {
     /// 本机实时行仅在首次扫描前回退使用；API 代理不重复计入。
     static func todayUsage(local: [CLIUsage], history: [String: UsageHistory.Totals], scope: DeviceScope,
                            historyReady: Bool = true) -> [CLIUsage] {
-        let labels = ["Claude": "Claude Code", "Codex": "Codex", "OpenCode": "opencode", "DSH": "DSH", "Grok": "Grok"]
+        let labels = ["Claude": "Claude Code", "Codex": "Codex", "OpenCode": "opencode", "DSH": "DSH", "Grok": "Grok", "CPA": "CPA"]
         var rows: [CLIUsage]
         if case .remote = scope { rows = [] } else { rows = local }
         guard historyReady else { return rows }
@@ -357,6 +358,7 @@ public struct DashboardView: View {
     @State private var exitNotifyOn: Bool
     @State private var fontScaleOn: Double
     @State private var refreshPending = false
+    @State private var devicePickerShown = false
 
     @State private var liveNow: Date = Date()
     @State private var network = NetworkSnapshot()
@@ -846,6 +848,7 @@ public struct DashboardView: View {
     }
     private func detailTitle(_ name: String) -> String {
         if name == Self.healthPage { return L("模型检查", "Model checks") }
+        if name == Self.devicesPage { return L("设备", "Devices") }
         if name == Self.pricesPage { return L("模型价格", "Model prices") }
         if name == Self.settingsPage { return L("设置", "Settings") }
         if name == Self.accountsPage { return L("当前登录账号", "Signed-in accounts") }
@@ -964,6 +967,8 @@ public struct DashboardView: View {
     }
 
     static let healthPage = "__health"
+    /// Screenshot-only page: the device switcher popover drawn inline (popovers don't render offscreen).
+    static let devicesPage = "__devices"
     static let pricesPage = "__prices"
     static let settingsPage = "__settings"
     static let livePage = "__live"
@@ -1012,6 +1017,8 @@ public struct DashboardView: View {
                                   mode: displayCurrency, quote: exchangeRates.quote)
             } else if drillDown == Self.accountsPage {
                 accountUsageList()
+            } else if drillDown == Self.devicesPage {
+                DevicePickerPanel(choices: deviceChoiceRows, selected: deviceScope.key) { deviceKey = $0 }
             } else if drillDown == Self.accountHistoryPage {
                 accountUsageList(historyMode: true)
             } else if drillDown == Self.livePage {
@@ -1067,18 +1074,71 @@ public struct DashboardView: View {
             + report.remoteHosts.map { (DeviceScope.remote($0).key, RemoteCollector.displayName(for: $0)) }
     }
     private var deviceScopeLabel: String { deviceChoices.first { $0.0 == deviceScope.key }?.1 ?? L("全部设备", "All devices") }
-    private var deviceScopeMenu: some View {
-        Menu {
-            ForEach(deviceChoices, id: \.0) { key, title in
-                Button { deviceKey = key } label: {
-                    if deviceKey == key { Label(title, systemImage: "checkmark") } else { Text(title) }
+    /// Today's activity per device for the switcher: cost, tokens, hourly shape and reachability.
+    private var deviceChoiceRows: [DeviceChoice] {
+        let usage = history.accountUsage
+        let cnyPerUSD = exchangeRates.quote?.cnyPerUSD ?? 7.2
+        var remoteIndex = 0
+        return deviceChoices.map { key, title in
+            let scope = DeviceScope.from(key: key)
+            var costs: [String: Double] = [:], tokens: Int64 = 0, hourly = Array(repeating: 0.0, count: 24)
+            for (source, totals) in usage.todayBySource where includesSource(source, scope: scope) {
+                tokens += totals.usage.tokenTotal
+                for (currency, value) in totals.equivalentCostByCurrency { costs[currency, default: 0] += value }
+                for (currency, hours) in usage.todayHourlyBySource[source] ?? [:] {
+                    let scale = currency == "CNY" ? 1 / cnyPerUSD : 1
+                    for (hour, value) in hours.enumerated() where hour < 24 && value.isFinite { hourly[hour] += value * scale }
                 }
             }
-        } label: {
-            GlassChipLabel(icon: deviceScope == .all ? "square.stack.3d.up" : isRemoteScope ? "server.rack" : "laptopcomputer",
-                           text: deviceScopeLabel)
+            let tokenText = tokens > 0 ? L(Fmt.tokens(tokens) + " token", String(format: "%.1fM tokens", Double(tokens) / 1e6)) : ""
+            let kind: DeviceChoice.Kind, online: Bool?, status: String
+            switch scope {
+            case .all:
+                kind = .all; online = nil; status = ""
+            case .local:
+                kind = .local; online = true; status = L("本机 · 在线", "This Mac · online")
+            case .remote(let host):
+                kind = .remote
+                if let device = report.remoteDeviceStatus[host] {
+                    if !device.error.isEmpty { online = false; status = L("连不上", "Unreachable") }
+                    else if let success = device.lastSuccess {
+                        online = true
+                        status = L("在线 · ", "Online · ") + UIFormat.agoShort(max(0, Int(nowTS - success)))
+                    } else { online = nil; status = L("等待首次同步", "Waiting for first sync") }
+                } else { online = nil; status = L("挂载目录", "Mounted folder") }
+            }
+            let color = DeviceChoice.color(kind: kind, index: remoteIndex)
+            if kind == .remote { remoteIndex += 1 }
+            // One amount per row: mixed currencies fold through the reference rate (original amounts stay in Statistics).
+            let mode: DisplayCurrency = displayCurrency == .original ? .usd : displayCurrency
+            var cost = costs.isEmpty ? "—" : MoneyDisplay.format(costs, mode: mode, quote: exchangeRates.quote).text
+            if costs.count > 1, exchangeRates.quote?.isUsable() != true {
+                // No current rate: fold with the default one, marked approximate, so the row still reads as one number.
+                let usd = costs.reduce(0.0) { $0 + ($1.key == "CNY" ? $1.value / cnyPerUSD : $1.value) }
+                cost = "≈" + (mode == .cny ? MoneyDisplay.amount(usd * cnyPerUSD, currency: "CNY") : MoneyDisplay.amount(usd, currency: "USD"))
+            }
+            return DeviceChoice(id: key, title: title, kind: kind, online: online, status: status,
+                                cost: cost, tokens: tokens, tokenText: tokenText, hourly: hourly, color: color)
         }
-        .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func includesSource(_ source: String, scope: DeviceScope) -> Bool {
+        !UsageHistory.isProxySource(source) && DeviceScope.includes(source: source, scope: scope, hosts: report.remoteHosts)
+    }
+
+    private var deviceScopeMenu: some View {
+        let rows = deviceChoiceRows
+        let current = rows.first { $0.id == deviceScope.key }
+        return Button { devicePickerShown.toggle() } label: {
+            GlassChipLabel(icon: current?.symbol ?? "square.stack.3d.up", text: deviceScopeLabel, tint: current?.color)
+        }
+        .buttonStyle(.plain).fixedSize(horizontal: false, vertical: true)
+        .popover(isPresented: $devicePickerShown, arrowEdge: .bottom) {
+            DevicePickerPanel(choices: rows, selected: deviceScope.key) { key in
+                deviceKey = key
+                devicePickerShown = false
+            }
+        }
         .help(L("选择用量设备；账号额度保持合并", "Choose usage devices; account quotas stay merged"))
         .accessibilityIdentifier("usage.device")
         .onChange(of: deviceKey) { _, _ in actions.relayout() }
@@ -1138,8 +1198,12 @@ public struct DashboardView: View {
             !confirmedIDs.contains(card.id) && card.account != nil &&
                 card.currentQuotas(at: nowTS).contains { nowTS - $0.capturedAt <= 6 * 3600 }
         }
-        let visible = Array((readable + pending).prefix(count))
+        // Subscription plans without a sign-in identity (Grok / GLM / Gemini) join the same ring grid.
+        let plans = PlanQuota.collect(local: currentLLMs, remote: report.remoteLLMs, now: nowTS)
+        let planCards = plans.map(\.card)
+        let visible = Array((readable + pending).prefix(count)) + planCards
         let pendingIDs = Set(pending.map(\.id))
+        let fullValue = fullValueTexts(visible)
         return VStack(alignment: .leading, spacing: 6) {
             TodayHeroTile(snapshot: history, scope: deviceScope, hosts: report.remoteHosts, now: nowTS,
                           mode: displayCurrency, quote: exchangeRates.quote,
@@ -1148,9 +1212,9 @@ public struct DashboardView: View {
             }
             FirstTokenStrip(snapshot: history, hosts: report.remoteHosts, now: nowTS, open: { openDetail(Self.livePage) })
             HStack(spacing: 6) {
-                Text(L("当前登录", "Signed in")).font(VG.caption.weight(.semibold)).foregroundStyle(.secondary)
-                VGInfoButton(title: L("当前登录账号", "Signed-in accounts"),
-                             text: L("只统计设备当前确认登录的订阅账号，同一账号跨设备合并。历史账号不计入；设备暂时联系不上时，最近 6 小时有额度的账号以淡色加 ? 显示，不计入账号数。外环为周额度，内环为 5 小时额度，均表示已用。", "Only currently confirmed subscription logins are counted, deduplicated across devices. Historical accounts are excluded; while a device is unreachable, accounts with quota in the last 6 h are shown dimmed with ? and not counted. Outer ring: weekly quota used. Inner ring: 5-hour quota used."))
+                Text(L("订阅", "Subscriptions")).font(VG.caption.weight(.semibold)).foregroundStyle(.secondary)
+                VGInfoButton(title: L("订阅额度", "Subscription quotas"),
+                             text: L("Grok / GLM / Gemini 订阅取各设备里最近一次读到的额度（GLM 按 key 指纹合并）；Gemini 没有可读的额度接口时显示「暂不可读」。「满额」学 sub2api 的算法：取这个额度窗口最近几小时的采样，用这段时间的请求按 API 价折算的花费 ÷ 额度涨了几个百分点，至少涨 3 个点才算，是估算。账号数只统计设备当前确认登录的订阅账号，同一账号跨设备合并。历史账号不计入；设备暂时联系不上时，最近 6 小时有额度的账号以淡色加 ? 显示，不计入账号数。外环为周额度，内环为 5 小时额度，均表示已用。", "Grok / GLM / Gemini use the most recent quota read on any device (GLM merged by key fingerprint); Gemini shows “not readable” without a quota source. “Full” follows sub2api: API-priced spend since the window’s oldest recent sample ÷ the points used, once it has moved at least 3 points; an estimate. Only currently confirmed subscription logins are counted, deduplicated across devices. Historical accounts are excluded; while a device is unreachable, accounts with quota in the last 6 h are shown dimmed with ? and not counted. Outer ring: weekly quota used. Inner ring: 5-hour quota used."))
                 if let error = accountLedgerError {
                     Image(systemName: "exclamationmark.triangle").font(VG.caption).foregroundStyle(.orange)
                         .help(L("周期记录读写失败：", "Cycle history unavailable: ") + error)
@@ -1169,9 +1233,13 @@ public struct DashboardView: View {
                     .help(L("当前登录账号与设备确认状态", "Current logins and device confirmation status"))
             }
             .padding(.horizontal, 2)
-            AccountQuotaGrid(cards: visible, now: nowTS, unconfirmedIDs: pendingIDs, open: { openDetail("account:" + $0) })
+            AccountQuotaGrid(cards: visible, now: nowTS, unconfirmedIDs: pendingIDs, fullValue: fullValue, open: { id in
+                if id.hasPrefix("plan:"), let plan = plans.first(where: { "plan:" + $0.id == id }) {
+                    if currentLLMs.contains(where: { $0.name == plan.runtimeName }) { openDetail(plan.runtimeName) }
+                } else { openDetail("account:" + id) }
+            })
             APIQuotaSection(providers: currentAPI.providers, dshBalance: UsageHistory.dshBalance,
-                            plans: PlanQuota.collect(local: currentLLMs, remote: report.remoteLLMs, now: nowTS), now: nowTS,
+                            plans: plans, now: nowTS,
                             openAPI: { if showAPITab { tab = 1 } else { openDetail(Self.apiPage) } })
             // Machine-state rows share one quiet style at the bottom: processes, then vitals.
             VStack(spacing: 5) {
@@ -1180,6 +1248,20 @@ public struct DashboardView: View {
             }
             .padding(.top, 2)
         }
+    }
+
+    /// sub2api-style "whole quota is worth" per tile, from the window that moved the most since its baseline.
+    private func fullValueTexts(_ cards: [AccountPresentation]) -> [String: String] {
+        var out: [String: String] = [:]
+        for card in cards {
+            let candidates = card.currentQuotas(at: nowTS).compactMap { q -> (AccountQuotaObservation, [String: Double])? in
+                AccountUsage.recentCapacity(q, points: history.accountUsage.points).map { (q, $0) }
+            }
+            guard let (q, value) = candidates.max(by: { ($0.0.usedPercent - ($0.0.baselinePercent ?? 0)) < ($1.0.usedPercent - ($1.0.baselinePercent ?? 0)) })
+            else { continue }
+            out[card.id] = "≈" + moneyText(value) + " / " + (q.window == "week" ? L("周", "wk") : q.window)
+        }
+        return out
     }
 
     private static let accountsPage = "__accounts__"
