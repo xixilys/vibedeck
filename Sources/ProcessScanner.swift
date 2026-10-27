@@ -2139,7 +2139,11 @@ public final class ProcessScanner {
 
     /// Gemini（Antigravity）：agy-hud 写的 quota_cache.json，两个池：gemini / 3p
     private func readGeminiQuota() -> (native5h: QuotaWindow?, nativeW: QuotaWindow?, tp5h: QuotaWindow?, tpW: QuotaWindow?) {
-        guard let json = readJSON("\(home)/.cache/agy-hud/quota_cache.json"),
+        // The statusline hook writes agy-quota.json (still under ~/.config/vibegauge when it was installed before
+        // the rename); agy-hud wrote quota_cache.json. Use whichever is freshest.
+        let candidates = ["\(home)/.config/vibedeck/agy-quota.json", "\(home)/.config/vibegauge/agy-quota.json",
+                          "\(home)/.cache/agy-hud/quota_cache.json"].compactMap { readJSON($0) }.filter { $0["pools"] is [String: Any] }
+        guard let json = candidates.max(by: { (($0["updated_at"] as? NSNumber)?.doubleValue ?? 0) < (($1["updated_at"] as? NSNumber)?.doubleValue ?? 0) }),
               let pools = json["pools"] as? [String: Any] else { return (nil, nil, nil, nil) }
         func win(_ pool: Any?, _ key: String) -> QuotaWindow? {
             guard let p = pool as? [String: Any], let w = p[key] as? [String: Any],
@@ -2231,7 +2235,7 @@ public final class ProcessScanner {
 
     private func geminiDetail(_ c: SessionCounts) -> PlatformDetail {
         var d = PlatformDetail()
-        d.sourceFiles = ["~/.gemini/antigravity-cli/", "~/.cache/agy-hud/quota_cache.json"]
+        d.sourceFiles = ["~/.gemini/antigravity-cli/", "~/.config/vibedeck/agy-quota.json", "~/.config/vibegauge/agy-quota.json"]
         if let st = readJSON("\(home)/.gemini/antigravity-cli/settings.json"), let m = st["model"] as? String {
             d.rows.append(("默认模型", m))
         }
@@ -2302,7 +2306,7 @@ public final class ProcessScanner {
                 fiveHour: q.native5h, sevenDay: q.nativeW,
                 secondaryPoolName: "三方", secondaryFiveHour: q.tp5h, secondarySevenDay: q.tpW,
                 isFullWidth: hasAny,
-                quotaSubtitle: "Antigravity · 无额度数据 (agy-hud 未刷新)",
+                quotaSubtitle: L("Antigravity · 无额度数据（状态栏还没写入）", "Antigravity · no quota data (statusline has not written it yet)"),
                 platformDetail: geminiDetail(c)
             ))
         }

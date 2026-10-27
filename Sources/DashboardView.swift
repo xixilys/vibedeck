@@ -1253,9 +1253,11 @@ public struct DashboardView: View {
     /// sub2api-style "whole quota is worth" per tile, from the window that moved the most since its baseline.
     private func fullValueTexts(_ cards: [AccountPresentation]) -> [String: String] {
         var out: [String: String] = [:]
+        // Baselines are at most 6 h old, so only recent points matter; deduplicate those once for every tile.
+        let recent = AccountUsage.deduplicated(history.accountUsage.points.filter { $0.timestamp >= nowTS - 7 * 3600 })
         for card in cards {
             let candidates = card.currentQuotas(at: nowTS).compactMap { q -> (AccountQuotaObservation, [String: Double])? in
-                AccountUsage.recentCapacity(q, points: history.accountUsage.points).map { (q, $0) }
+                AccountUsage.recentCapacity(q, points: recent).map { (q, $0) }
             }
             guard let (q, value) = candidates.max(by: { ($0.0.usedPercent - ($0.0.baselinePercent ?? 0)) < ($1.0.usedPercent - ($1.0.baselinePercent ?? 0)) })
             else { continue }

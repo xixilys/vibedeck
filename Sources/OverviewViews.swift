@@ -525,7 +525,7 @@ enum Brand {
         case "opencode", "opencode go": return Color(red: 0.96, green: 0.62, blue: 0.14)
         case "grok", "xai": return Color.primary.opacity(0.78)
         case "cpa": return Color(red: 0.93, green: 0.36, blue: 0.55)
-        case "gemini", "google": return Color(red: 0.26, green: 0.52, blue: 0.96)
+        case "gemini", "google", "antigravity": return Color(red: 0.26, green: 0.52, blue: 0.96)
         case "kimi", "moonshot": return Color(red: 0.55, green: 0.40, blue: 0.95)
         case "glm", "zhipu", "z.ai": return Color(red: 0.20, green: 0.55, blue: 0.95)
         default: return .secondary
@@ -709,7 +709,7 @@ struct PlanQuota: Identifiable {
     }
 
     static func collect(local: [DetectedLLMRuntime], remote: [String: [DetectedLLMRuntime]], now: TimeInterval) -> [PlanQuota] {
-        let names = ["Grok": "Grok", "GLM": "GLM", "Gemini": "Gemini", "Antigravity": "Gemini"]
+        let names = ["Grok": "Grok", "GLM": "GLM", "Gemini": "Antigravity", "Antigravity": "Antigravity"]
         var best: [String: (runtime: DetectedLLMRuntime, device: String, captured: TimeInterval, host: String?)] = [:]
         let candidates: [(DetectedLLMRuntime, String, String?)] = local.map { ($0, L("本机", "Local"), nil) }
             + remote.sorted { $0.key < $1.key }.flatMap { host, list in list.map { ($0, RemoteCollector.displayName(for: host), host) } }
@@ -751,7 +751,7 @@ struct PlanQuota: Identifiable {
             return PlanQuota(id: key, brand: brand, title: title, detail: detail, bars: bars,
                              runtimeName: r.name, source: source, observations: observations)
         }.sorted { a, b in
-            let order = ["Grok", "GLM", "Gemini"]
+            let order = ["Grok", "GLM", "Antigravity"]
             return (order.firstIndex(of: a.brand) ?? 9, a.id) < (order.firstIndex(of: b.brand) ?? 9, b.id)
         }
     }

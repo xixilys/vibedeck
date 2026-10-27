@@ -457,10 +457,23 @@ def _grok_quota(home):
             break
     return best, tier
 
+# Antigravity's quota: written by the statusline hook (VibeDeck's, or VibeGauge's before the rename) or agy-hud.
+_AGY_QUOTA_FILES = ((".config", "vibedeck", "agy-quota.json"), (".config", "vibegauge", "agy-quota.json"),
+                    (".cache", "agy-hud", "quota_cache.json"))
+
+def _agy_quota_file(home):
+    best, best_at = None, -1.0
+    for parts in _AGY_QUOTA_FILES:
+        obj = _read_json_bounded([os.path.join(home, *parts)], 1024 * 1024)
+        if isinstance(obj, dict) and isinstance(obj.get("pools"), dict):
+            at = _finite_number(obj.get("updated_at")) or 0.0
+            if at > best_at:
+                best, best_at = obj, at
+    return best
+
 def _agy_quotas(home):
-    path = os.path.join(home, ".cache", "agy-hud", "quota_cache.json")
-    obj = _read_json_bounded([path], 1024 * 1024)
-    if not isinstance(obj, dict) or not isinstance(obj.get("pools"), dict):
+    obj = _agy_quota_file(home)
+    if obj is None:
         return None, None
     pools = obj["pools"]
     captured_default = _finite_number(obj.get("updated_at"))

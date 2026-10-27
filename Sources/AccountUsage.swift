@@ -173,7 +173,7 @@ public enum AccountUsage {
         return nil
     }
 
-    static func deduplicated(_ points: [AccountUsagePoint]) -> [AccountUsagePoint] {
+    public static func deduplicated(_ points: [AccountUsagePoint]) -> [AccountUsagePoint] {
         var kept: [AccountUsagePoint] = [], indices: [String: Int] = [:]
         for point in points.sorted(by: { ($0.source, $0.timestamp, $0.model) < ($1.source, $1.timestamp, $1.model) }) {
             guard let account = point.account, let id = point.exactRequestID else { kept.append(point); continue }
@@ -242,13 +242,14 @@ public enum AccountUsage {
     /// sub2api-style full-value estimate: what the requests made since the window's baseline sample cost at
     /// API prices, divided by how many percent they used. Needs ≥ 3 points of movement over ≥ 15 minutes,
     /// so one rounding step can't swing it wildly. Original currencies are kept.
+    /// `points` must already be deduplicated (`deduplicated(_:)`); callers do that once for all tiles.
     public static func recentCapacity(_ q: AccountQuotaObservation, points: [AccountUsagePoint]) -> [String: Double]? {
         guard let start = q.baselineAt, let base = q.baselinePercent, start.isFinite, q.capturedAt - start >= 900,
               q.usedPercent.isFinite else { return nil }
         let delta = q.usedPercent - base
         guard delta >= 3 else { return nil }
         var spent: [String: Double] = [:]
-        for point in deduplicated(points) where point.origin == "cli" && point.timestamp > start && point.timestamp <= q.capturedAt {
+        for point in points where point.origin == "cli" && point.timestamp > start && point.timestamp <= q.capturedAt {
             let matches: Bool
             if let account = q.account { matches = point.account == account && point.pool == q.pool }
             // A coding plan's key is shared by every tool and device that calls its models.
