@@ -12,9 +12,37 @@ enum MenuBarPet {
     /// Seconds per animation frame for a CPU load (0–100). Idle → nil (sitting).
     static func frameInterval(cpu: Double) -> TimeInterval? {
         guard cpu.isFinite, cpu >= 12 else { return nil }
-        // 12% → 0.32 s per frame, 100% → 0.07 s: a lazy trot up to a sprint.
+        // 12% → 0.32 s per frame, 100% → 0.12 s: a lazy trot up to a sprint. Faster than ~8 fps costs the
+        // menu bar (every frame is re-snapshotted for each display) more than it adds.
         let t = min(1, (cpu - 12) / 88)
-        return 0.32 - 0.25 * t
+        return 0.32 - 0.20 * t
+    }
+
+    private static var cache: [String: NSImage] = [:]
+
+    /// Rasterised once per pose/alert/label and reused: the status item then only swaps bitmaps instead of
+    /// running the vector drawing for every frame and display.
+    static func cachedImage(pose: Pose, alert: Bool, label: String?) -> NSImage {
+        let key = "\(pose)|\(alert)|\(label ?? "")"
+        if let hit = cache[key] { return hit }
+        let vector = image(pose: pose, alert: alert, label: label)
+        let raster = NSImage(size: vector.size)
+        for scale in [1, 2] as [CGFloat] {
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(vector.size.width * scale), pixelsHigh: Int(vector.size.height * scale),
+                                             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                                             bytesPerRow: 0, bitsPerPixel: 0) else { return vector }
+            rep.size = vector.size
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            vector.draw(in: NSRect(origin: .zero, size: vector.size))
+            NSGraphicsContext.restoreGraphicsState()
+            raster.addRepresentation(rep)
+        }
+        raster.isTemplate = true
+        raster.accessibilityDescription = vector.accessibilityDescription
+        if cache.count > 64 { cache.removeAll() }  // labels change rarely; keep the table small
+        cache[key] = raster
+        return raster
     }
 
     static func image(pose: Pose, alert: Bool, label: String?) -> NSImage {
@@ -171,6 +199,8 @@ final class MenuBarPetAnimator {
     private var interval: TimeInterval?
     private var sitTicks = 0
     private var lastKey = ""
+    /// While the panel is open the pup sits still, so the menu bar never competes with the panel for the main thread.
+    private var paused = false
 
     init(button: NSStatusBarButton) {
         self.button = button
@@ -180,8 +210,15 @@ final class MenuBarPetAnimator {
     }
 
     /// Called on the main queue after each scan / system sample.
+    func setPaused(_ value: Bool) {
+        guard paused != value else { return }
+        paused = value
+        if value { timer?.invalidate(); timer = nil; render(.sit) } else { interval = nil; update(cpu: cpu, alert: alert, label: label) }
+    }
+
     func update(cpu: Double, alert: Bool, label: String?) {
         self.cpu = cpu; self.alert = alert; self.label = label
+        guard !paused else { render(.sit); return }
         let next = MenuBarPet.frameInterval(cpu: cpu)
         // Only restart the timer when the pace changes noticeably, so the gait stays smooth.
         if next.map({ n in interval.map { abs($0 - n) > 0.03 } ?? true }) ?? (interval != nil) || timer == nil {
@@ -215,7 +252,7 @@ final class MenuBarPetAnimator {
         let key = "\(pose)|\(alert)|\(label ?? "")"
         guard key != lastKey, let button else { return }
         lastKey = key
-        button.image = MenuBarPet.image(pose: pose, alert: alert, label: label)
+        button.image = MenuBarPet.cachedImage(pose: pose, alert: alert, label: label)
     }
 
     func stop() { timer?.invalidate(); timer = nil }

@@ -797,9 +797,11 @@ public struct DashboardView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .refreshVibeDeckPanel)) { _ in rescanAll() }
         .onReceive(NotificationCenter.default.publisher(for: .vibeDeckPanelReopened)) { _ in
-            // A kept panel reopens on its top page with fresh snapshots, like a newly built one.
-            drillDown = nil
-            liveNow = Date()
+            // A kept panel reopens on its top page with fresh snapshots, like a newly built one. Only real changes
+            // are assigned, so an unchanged panel isn't re-rendered while it appears.
+            if drillDown != nil { drillDown = nil }
+            let now = Date()
+            if Int(now.timeIntervalSince1970 / 30) != Int(liveNow.timeIntervalSince1970 / 30) { liveNow = now }
             refreshLive()
         }
         .onReceive(NotificationCenter.default.publisher(for: .selectVibeDeckTab)) { note in
@@ -824,7 +826,7 @@ public struct DashboardView: View {
                     Text(detailTitle(name)).font(VG.headline).lineLimit(1).truncationMode(.middle)
                 } else {
                     // The same pup as the menu bar, in the brand gradient.
-                    Image(nsImage: MenuBarPet.image(pose: .sit, alert: false, label: nil)).renderingMode(.template)
+                    Image(nsImage: MenuBarPet.cachedImage(pose: .sit, alert: false, label: nil)).renderingMode(.template)
                         .resizable().interpolation(.high).frame(width: 26 * VG.scale, height: 22 * VG.scale)
                         .foregroundStyle(LinearGradient(colors: [Glass.money, Glass.moneyEnd], startPoint: .topLeading, endPoint: .bottomTrailing))
                     Text("VibeDeck").font(.system(size: 14 * VG.scale, weight: .bold, design: .rounded))
@@ -856,6 +858,8 @@ public struct DashboardView: View {
         if name == Self.livePage { return L("实时与设备", "Live & devices") }
         if name == Self.apiPage { return L("API 与套餐", "API & plans") }
         if name == Self.processesPage { return L("Codex 进程", "Codex processes") }
+        // Only account pages need the (expensive) card list; platform pages are titled by their name.
+        guard name.hasPrefix("account:") else { return name }
         return allAccountCards.first { "account:" + $0.id == name }?.title ?? name
     }
     private var tabItems: [GlassTabBar.Item] {
@@ -1184,6 +1188,8 @@ public struct DashboardView: View {
     /// Daily activity comes first; account quotas stay global while usage follows the device menu.
     private var aiSection: some View {
         let order = ["Claude", "Codex"]
+        // Built once per render: each access of accountCards merges and sorts every quota and usage group again.
+        let accountCards = self.accountCards
         let readable = accountCards.enumerated().sorted { a, b in
             let ta = a.element.title.components(separatedBy: " · ").first ?? "", tb = b.element.title.components(separatedBy: " · ").first ?? ""
             let ia = order.firstIndex(of: ta) ?? order.count, ib = order.firstIndex(of: tb) ?? order.count

@@ -32,8 +32,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var panelGeneration: UInt = 0
     /// The SwiftUI tree is kept for a while after the panel closes: rebuilding it on every click was the open lag.
     private var cachedPanelKey: String?
-    private var panelClosedAt: TimeInterval = 0
-    private static let panelCacheSeconds: TimeInterval = 30 * 60
+    private var panelPrewarmed = false
     private var pendingPanelHeight: CGFloat?
     private var pet: MenuBarPetAnimator?
     private var petSample: AnyCancellable?
@@ -231,11 +230,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         previousPanelApplication = previous?.processIdentifier == ProcessInfo.processInfo.processIdentifier ? nil : previous
         restorePanelFocusOnClose = false
         isPanelOpen = true
+        pet?.setPaused(true)
         NetworkScanner.shared.setPanelVisible(true)
         SystemMonitor.shared.setVisible(true)
+        let started = CACurrentMediaTime()
         let reused = canReusePanel()
         if !reused { buildPanel() }
+        let built = CACurrentMediaTime()
         panelPopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        let shown = CACurrentMediaTime()
         guard panelPopover.isShown else { finishClosingPanel(); return }
         // Only a user opening the panel activates it. Background refreshes never take focus.
         NSApp.activate()
@@ -244,6 +247,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         relayoutPanel()
         if reused { NotificationCenter.default.post(name: .vibeDeckPanelReopened, object: nil) }
         updateStatus()
+        // Open timing for diagnosis (`log show --predicate 'subsystem == "io.github.xixilys.vibedeck"'`):
+        // build, show (first layout), and until the main loop is free again (first frame committed).
+        let handled = CACurrentMediaTime()
+        DispatchQueue.main.async { [log] in
+            let ms = { (a: CFTimeInterval, b: CFTimeInterval) in Int((b - a) * 1000) }
+            log.notice("panel open reused=\(reused) build=\(ms(started, built))ms show=\(ms(built, shown))ms after=\(ms(shown, handled))ms settle=\(ms(handled, CACurrentMediaTime()))ms")
+        }
     }
 
     private var panelKey: String {
@@ -251,16 +261,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func canReusePanel() -> Bool {
-        guard hostingView != nil, panelPopover.contentViewController != nil, cachedPanelKey == panelKey,
-              Date().timeIntervalSince1970 - panelClosedAt < Self.panelCacheSeconds else { return false }
-        return true
+        hostingView != nil && panelPopover.contentViewController != nil && cachedPanelKey == panelKey
     }
 
-    private func dropPanelCache() {
-        panelPopover.contentViewController = nil
-        hostingView = nil
-        cachedPanelKey = nil
+    /// The first SwiftUI layout of the whole panel took ~0.5 s inside the first click. Build and lay it out once
+    /// while idle after the first scan, so even the first open reuses a ready tree.
+    private func prewarmPanelOnce() {
+        guard !panelPrewarmed, !isPanelOpen, hostingView == nil else { return }
+        panelPrewarmed = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, !self.isPanelOpen, self.hostingView == nil else { return }
+            let started = CACurrentMediaTime()
+            self.buildPanel()
+            if let host = self.hostingView {
+                host.layoutSubtreeIfNeeded()
+                _ = host.fittingSize
+            }
+            self.log.notice("panel prewarm \(Int((CACurrentMediaTime() - started) * 1000))ms")
+        }
     }
+
 
     private func closePanel(restoreFocus: Bool = true) {
         restorePanelFocusOnClose = restoreFocus
@@ -280,19 +300,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func finishClosingPanel() {
         guard isPanelOpen else { return }
         isPanelOpen = false
+        pet?.setPaused(false)
         NetworkScanner.shared.setPanelVisible(false)
         SystemMonitor.shared.setVisible(false)
         // The generation stays: a kept panel still reports its height through the same actions.
         pendingPanelHeight = nil
         isRelayoutScheduled = false
         removeSwipeMonitor()
-        // Keep the built panel for the next click; free it if it stays closed for a long time.
-        let closedAt = Date().timeIntervalSince1970
-        panelClosedAt = closedAt
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.panelCacheSeconds) { [weak self] in
-            guard let self, !self.isPanelOpen, self.panelClosedAt == closedAt else { return }
-            self.dropPanelCache()
-        }
+        // The built panel is kept for the next click (rebuilt only when font size or language change).
         let previous = previousPanelApplication
         previousPanelApplication = nil
         let restoreFocus = restorePanelFocusOnClose
@@ -420,6 +435,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 self?.isScanning = false
                 self?.currentReport = report
                 self?.renderStatusButton(report: report)
+                self?.prewarmPanelOnce()
                 self?.reapIfMemoryTight(report)
             }
         }
