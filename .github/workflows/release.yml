@@ -4,13 +4,16 @@ on:
   push:
     tags:
       - 'v*'
+  # macOS 14 images retired on 2026-11-02; runners moved to macos-15.
+  # workflow_dispatch lets a failed tag run be retried without moving the tag.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   release:
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: write
 
@@ -20,10 +23,14 @@ jobs:
       with:
         persist-credentials: false
 
-    - name: Check tag matches app version
+    - name: Resolve release tag
+      id: release
       run: |
         v=$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' Resources/Info.plist)
-        [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME != Info.plist v$v"; exit 1; }
+        echo "tag=v$v" >> "$GITHUB_OUTPUT"
+        if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME != Info.plist v$v"; exit 1; }
+        fi
 
     - name: Compile and Bundle App
       run: |
@@ -42,10 +49,13 @@ jobs:
     - name: Create GitHub Release
       uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
       with:
+        tag_name: ${{ steps.release.outputs.tag }}
+        allowUpdates: true
         files: |
           VibeDeck.zip
           VibeDeck.zip.sha256
         fail_on_unmatched_files: true
         draft: false
         prerelease: false
-        generate_release_notes: true
+        # A manual retry must not overwrite hand-written notes; only a fresh tag regenerates them.
+        generate_release_notes: ${{ github.ref_type == 'tag' }}
