@@ -19,7 +19,7 @@ ARCHS="${ARCHS:-arm64 x86_64}"
 for ARCH in ${ARCHS}; do
     echo "    - ${ARCH}"
     clang -O2 -target "${ARCH}-apple-macosx14.0" -c Sources/FanSMC.c -o "${OUTPUT_DIR}/FanSMC-${ARCH}.o"
-    swiftc -O \
+    swiftc -O -swift-version 5 \
         -target "${ARCH}-apple-macosx14.0" \
         -framework Cocoa \
         -framework SwiftUI \
@@ -33,6 +33,7 @@ for ARCH in ${ARCHS}; do
         Sources/DesignSystem.swift \
         Sources/GlassKit.swift \
         Sources/SystemMonitor.swift \
+        Sources/ExternalDiskMonitor.swift \
         Sources/SystemTabView.swift \
         Sources/OverviewViews.swift \
         Sources/PricingCatalog.swift \
@@ -41,6 +42,9 @@ for ARCH in ${ARCHS}; do
         Sources/AccountUsage.swift \
         Sources/AccountMonitor.swift \
         Sources/MoneyDisplay.swift \
+        Sources/VM2APIQuota.swift \
+        Sources/VM2APIViews.swift \
+        Sources/SubscriptionMonitorPanel.swift \
         Sources/AccountViews.swift \
         Sources/PriceSync.swift \
         Sources/CodexProcessMonitor.swift \
@@ -71,7 +75,7 @@ for ARCH in ${ARCHS}; do
         Sources/main.swift \
         "${OUTPUT_DIR}/FanSMC-${ARCH}.o" \
         -o "${OUTPUT_DIR}/${APP_NAME}-${ARCH}"
-    swiftc -O \
+    swiftc -O -swift-version 5 \
         -target "${ARCH}-apple-macosx14.0" \
         -framework Foundation -framework IOKit -framework Security \
         -import-objc-header Sources/FanSMC.h \

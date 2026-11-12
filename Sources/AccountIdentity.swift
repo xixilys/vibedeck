@@ -14,8 +14,11 @@ public struct AccountIdentity: Codable, Hashable {
             return UUID(uuidString: value)?.uuidString.lowercased() ?? value
         }
         guard let subject = identifier(accountID), let rawProvider = identifier(provider) else { return nil }
+        // A device can reach the same ChatGPT account through a gateway instead of api.openai.com; its logs then
+        // name the gateway (e.g. "magpie", "openai-routed"). Those are labels for the same upstream account, so they
+        // collapse onto "openai" — the account id still separates two genuinely different logins.
         switch rawProvider.lowercased() {
-        case "codex", "openai": self.provider = "openai"
+        case "codex", "openai", "openai-routed", "magpie": self.provider = "openai"
         case "claude", "anthropic": self.provider = "anthropic"
         default: self.provider = rawProvider.lowercased()
         }

@@ -9,6 +9,12 @@ struct AccountPresentation: Identifiable {
     var signedInSources: [String] = []
     /// Subscription plans without a sign-in identity (Grok, GLM, Gemini) carry their own "Tool · Plan" title.
     var planTitle: String? = nil
+    /// A tiny source marker on plan-style cards ("vm2api"); nil for ordinary local subscriptions.
+    var planBadge: String? = nil
+    /// A short reason when a plan-style card has no readable quota ("Claude 无样本").
+    var planNote: String? = nil
+    /// vm2api keeps both windows visible even after a reset: "5h 0% · 已重置" is more useful than hiding it.
+    var keepsExpiredWindows = false
 
     var title: String {
         if let planTitle { return planTitle }
@@ -156,6 +162,20 @@ struct AccountPresentation: Identifiable {
         var undated = q; undated.resetAt = nil
         precondition(cards(usage: AccountUsageSnapshot(), quotas: [undated], now: 200)[0].currentQuotas(at: 200).count == 1)
     }
+    /// Same dedup as `currentQuotas`, but plan cards can opt into showing an expired window as 0%.
+    func displayQuotas(at now: TimeInterval) -> [AccountQuotaObservation] {
+        guard keepsExpiredWindows else { return currentQuotas(at: now) }
+        var latest: [String: AccountQuotaObservation] = [:]
+        for q in quotas {
+            let key = q.pool + ":" + q.window
+            if let old = latest[key] {
+                if old.trusted && !q.trusted { continue }
+                if q.trusted == old.trusted && q.capturedAt < old.capturedAt { continue }
+            }
+            latest[key] = q
+        }
+        return latest.values.sorted { ($0.pool, $0.window) < ($1.pool, $1.window) }
+    }
     func currentQuotas(at now: TimeInterval) -> [AccountQuotaObservation] {
         var latest: [String: AccountQuotaObservation] = [:]
         for q in quotas where q.resetAt.map({ $0 > now }) ?? true {
@@ -238,6 +258,8 @@ struct AccountDetailView: View {
     let now: TimeInterval
     let mode: DisplayCurrency
     let quote: ExchangeQuote?
+    /// Money view per window, from the same estimate the tiles use (planes added, multi-device median).
+    var values: [String: QuotaWindowValue] = [:]
 
     private func money(_ totals: AccountUsageTotals) -> String {
         MoneyDisplay.format(totals.equivalentCostByCurrency, mode: mode, quote: quote).text
@@ -252,8 +274,8 @@ struct AccountDetailView: View {
                     HStack(spacing: 5) {
                         Text(L("当前额度周期", "Current quota periods")).font(VG.caption.weight(.semibold)).foregroundStyle(.secondary)
                         VGInfoButton(title: L("这些数字怎么来的", "How these are calculated"),
-                                     text: L("百分比是官方额度已用多少。金额是这个周期里你的 token 按 API 官方价折算的“等价花费”，不是实际扣款。满额价值 = 已花 ÷ 已用百分比，例如花了 $120 用掉 30%，整个额度约值 $400；只有从周期开始就完整记录、读数是最新的时候才算。",
-                                             "The percentage is how much of the official quota is used. The amount is your tokens this period valued at public API prices — an equivalent, not a charge. Full value = spent ÷ percent used (e.g. $120 at 30% ≈ $400 for the whole quota); shown only when the whole period was recorded and the reading is fresh."))
+                                     text: L("百分比是官方额度已用多少。金额是这个周期里你的 token 按 API 官方价折算的“等价花费”，不是实际扣款，回答这一管已经用掉多少。满额价值 = 已花 ÷ 已用百分比，例如花了 $120 用掉 30%，整个额度约值 $400；本周期记录完整时直接用这个算法，不完整时退回「最近几小时的额度变化」并合并各设备采样取中位数。CPA 和本机 Codex 登录的是同一个账号、共用同一个额度桶，只是记录在不同机器上：设备日志和 CPA 的用量会相加，一起消耗这个窗口的百分比（本机代理是 CLI 的镜像，不重复计入）；ChatGPT 订阅内的请求（chatgpt-web 池）也计入同一个 Codex 额度。",
+                                             "The percentage is official quota used. The amount is your tokens this period valued at public API prices — an equivalent, not a charge — and answers how much of this refill is gone. Full value = spent ÷ percent used (e.g. $120 at 30% ≈ $400) when the whole period is recorded; otherwise the recent quota movement is used, taking the median of every device's sample. Planes (device logs / CPA / local proxy) are added: a local CLI does not route through the relay here, so CPA usage from other clients counts without recording any request twice; hover or open the details to see the split."))
                     }
                     ForEach(current) { cycle in cycleRow(cycle) }
                 }
@@ -293,11 +315,15 @@ struct AccountDetailView: View {
         }
         .task(id: card.id + ":" + String(capturedAt) + ":" + String(card.quotas.map(\.capturedAt).max() ?? 0)) {
             let quotas = card.quotas, allPoints = points, start = coverageStart, time = now, account = card.account
+            let origins = quotas.map { q in
+                values[AccountUsage.valueKey(account: q.account, pool: q.pool, window: q.window)]?.origin ?? "cli"
+            }
             let result = await Task.detached(priority: .utility) {
                 // Only this account's points (and unassigned ones, which the boundary checks need) — not all 77k.
                 let relevant = allPoints.filter { $0.account == nil || $0.account == account }
-                return quotas.map { AccountUsage.cycle(observation: $0, points: relevant, coverageStart: start, now: time) }
-                    .sorted { ($0.observation.resetAt ?? 0) > ($1.observation.resetAt ?? 0) }
+                return zip(quotas, origins).map { observation, origin in
+                    AccountUsage.cycle(observation: observation, points: relevant, coverageStart: start, origin: origin, now: time)
+                }.sorted { ($0.observation.resetAt ?? 0) > ($1.observation.resetAt ?? 0) }
             }.value
             if !Task.isCancelled { cycles = AccountPresentation.distinctCycles(result) }
         }
@@ -329,43 +355,95 @@ struct AccountDetailView: View {
         let q = cycle.observation
         let active = q.resetAt.map { now < $0 } ?? false
         let fresh = q.trusted && now - q.capturedAt <= 600 && q.capturedAt <= now + 60
-        let capacity = active && fresh ? cycle.capacityUSD : nil
+        // The tile estimate adds every accounting plane for this window; it can include CPA usage that the
+        // legacy whole-cycle path (CLI plane only) cannot see.
+        let value = active ? values[AccountUsage.valueKey(account: q.account, pool: q.pool, window: q.window)]
+            .flatMap { AccountUsage.sameQuotaCycle($0.resetAt, q.resetAt) ? $0 : nil } : nil
+        let capacityText: String? = value.flatMap {
+            $0.hasCapacity ? MoneyDisplay.format($0.capacityByCurrency, mode: mode, quote: quote).text : nil
+        } ?? (active && fresh ? cycle.capacityUSD.map { MoneyDisplay.format(["USD": $0], mode: mode, quote: quote).text } : nil)
+        let consumedText: String? = {
+            if let value, !value.consumedByCurrency.isEmpty {
+                return MoneyDisplay.format(value.consumedByCurrency, mode: mode, quote: quote).text
+            }
+            return cycle.coverage == "unknown" ? nil : money(cycle.consumed)
+        }()
         let windowName = q.window == "week" ? L("每周额度", "Weekly quota") : q.window == "5h" ? L("5 小时额度", "5-hour quota") : q.window
         let why: String = {
-            if capacity != nil { return "" }
+            if capacityText != nil { return "" }
             if q.resetAt == nil { return L("不知道何时重置，估不出满额价值", "Reset time unknown, so the full value can’t be estimated") }
             if !active { return L("这个周期已结束", "This period has ended") }
             if !fresh { return L("额度读数 \(UIFormat.agoShort(max(0, Int(now - q.capturedAt))))未更新，暂不估满额价值", "Quota reading is \(UIFormat.agoShort(max(0, Int(now - q.capturedAt)))) old; full value not estimated") }
-            return L("这个周期开始时还没在记录，下个周期起能估出满额价值", "Recording started mid-period; the full value is available from the next period")
+            if let value, value.basis.isEmpty, value.consumedByCurrency.isEmpty {
+                return L("这个周期的用量还没记录", "No usage recorded for this period yet")
+            }
+            return L("最近几小时的额度变化不足（需要至少涨 3 个百分点、跨度 15 分钟），或本周期记录不完整，暂不估满额价值",
+                     "The last few hours moved less than 3 percentage points over 15 minutes, or the cycle is not fully recorded, so the full value is not estimated")
         }()
         let tint = fresh ? VG.heat(Int(q.usedPercent)) : Color.secondary
-        return HStack(alignment: .center, spacing: 12) {
+        // Keep the ring as an explicitly erased view; the combined HStack expression otherwise exceeds the
+        // Swift constraint solver's budget in whole-module -O builds.
+        let ringView = AnyView(
             ZStack {
                 RingGauge(value: q.usedPercent / 100, tint: tint, lineWidth: 5)
                 Text(AccountPresentation.percent(q.usedPercent)).font(.system(size: 11 * VG.scale, weight: .bold, design: .rounded)).monospacedDigit()
             }
             .frame(width: 46 * VG.scale, height: 46 * VG.scale)
-            VStack(alignment: .leading, spacing: 3) {
+        )
+        let detailsView = AnyView(            VStack(alignment: .leading, spacing: 3) {
                 HStack {
                     Text(windowName).font(VG.font(13, .semibold))
                     Spacer(minLength: 4)
                     Text(active ? (QuotaPresentation.compactReset(to: q.resetAt, now: now).map { L("\($0)后重置", "resets in \($0)") } ?? "") : L("已结束", "Ended"))
                         .font(VG.caption).foregroundStyle(.secondary)
                 }
-                Text(cycle.coverage == "unknown" ? L("这个周期的花费还没有记录", "No spend recorded for this period yet")
-                     : L("这个周期用了约 ", "Used about ") + money(cycle.consumed) + L("（API 等价）", " this period (API equivalent)"))
-                    .font(VG.callout).fixedSize(horizontal: false, vertical: true)
-                if let capacity {
-                    Text(L("整个额度约值 ", "Whole quota is worth about ") + MoneyDisplay.format(["USD": capacity], mode: mode, quote: quote).text)
-                        .font(VG.callout.weight(.semibold)).foregroundStyle(Glass.money)
+                if let consumedText {
+                    Text(L("本周期已用约 ", "Used about ") + consumedText + L("（API 等价）", " this cycle (API equivalent)"))
+                        .font(VG.callout).fixedSize(horizontal: false, vertical: true)
+                    if let value, !value.covered {
+                        Text(L("周期开始前的记录不全，这是下限", "Part of this cycle predates collection; a lower bound"))
+                            .font(.system(size: 10 * VG.scale)).foregroundStyle(.tertiary)
+                    }
                 } else {
+                    Text(L("这个周期的花费还没有记录", "No spend recorded for this period yet"))
+                        .font(VG.callout).fixedSize(horizontal: false, vertical: true)
+                }
+                if let capacityText {
+                    Text(L("满额约值 ", "Whole quota is worth about ") + capacityText)
+                        .font(VG.callout.weight(.semibold)).foregroundStyle(Glass.money)
+                    if let value, !value.covered {
+                        Text(L("按最近几小时的额度变化折算", "Derived from the last few hours of quota movement"))
+                            .font(.system(size: 10 * VG.scale)).foregroundStyle(.tertiary)
+                    }
+                }
+                if let value, value.consumedByOrigin.count > 1 {
+                    let parts = value.consumedByOrigin.keys.sorted().map { origin -> String in
+                        let name = origin == "cli" ? L("设备日志", "device logs") : origin == "cpa" ? "CPA" : origin.uppercased()
+                        return name + " " + MoneyDisplay.format(value.consumedByOrigin[origin] ?? [:], mode: mode, quote: quote).text
+                    }
+                    Text(L("构成：", "Composition: ") + parts.joined(separator: " + "))
+                        .font(.system(size: 10 * VG.scale)).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let value, value.unpricedRequests > 0 {
+                    Text(L("\(value.unpricedRequests) 次请求未定价，金额偏低", "\(value.unpricedRequests) unpriced requests understate the amount"))
+                        .font(.system(size: 10 * VG.scale)).foregroundStyle(.tertiary)
+                } else if !why.isEmpty {
                     Text(why).font(.system(size: 10 * VG.scale)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
                 }
             }
-        }
+        )
+        let helpText: String = (q.startedAt.map(date) ?? "?") + " → " + (q.resetAt.map(date) ?? "?") + "\n"
+            + L("读数来自 ", "Reading from ") + AccountPresentation.sourceLabel(q.source) + " · " + date(q.capturedAt)
+            + (value.map { detail in "\n" + AccountUsage.estimateDetail(detail, format: { MoneyDisplay.format($0, mode: mode, quote: quote).text }) } ?? "")
+        let row = AnyView(HStack(alignment: .center, spacing: 12) {
+            ringView
+            detailsView
+        })
+        return row
         .padding(10).frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.04)))
-        .help((q.startedAt.map(date) ?? "?") + " → " + (q.resetAt.map(date) ?? "?") + "\n" + L("读数来自 ", "Reading from ") + AccountPresentation.sourceLabel(q.source) + " · " + date(q.capturedAt))
+        .help(helpText)
     }
     private func day(_ timestamp: TimeInterval) -> String {
         let formatter = DateFormatter(); formatter.locale = AppLanguage.current.locale; formatter.dateFormat = "M/d"

@@ -115,6 +115,8 @@ final class SystemMonitor: ObservableObject {
         queue.async { [weak self] in
             guard let self, self.thermostat != active else { return }
             self.thermostat = active
+            // Smart cooling needs a temperature now, not at the next timer tick (up to 10 s away).
+            if active, self.started { self.sample() }
             if self.started { self.schedule() }
         }
     }
@@ -272,7 +274,7 @@ final class SystemMonitor: ObservableObject {
         if sensorKeys == nil { sensorKeys = Self.discoverSensorKeys() }
         guard let keys = sensorKeys else { return }
         let cpu = keys.cpu.compactMap(Self.temperature)
-        if !cpu.isEmpty { s.cpuTemp = cpu.reduce(0, +) / Double(cpu.count); s.cpuTempMax = cpu.max() }
+        if !cpu.isEmpty { s.cpuTemp = cpu.reduce(0, +) / Double(cpu.count); s.cpuTempMax = Self.robustMax(cpu) }
         let gpu = keys.gpu.compactMap(Self.temperature)
         if !gpu.isEmpty { s.gpuTemp = gpu.reduce(0, +) / Double(gpu.count) }
         let ssd = keys.ssd.compactMap(Self.temperature)
@@ -297,6 +299,17 @@ final class SystemMonitor: ObservableObject {
         }
         let fans = FanSMC.readByte("FNum").map(Int.init) ?? 0
         return (cpu, gpu, ssd, min(fans, 4))
+    }
+
+    /// Hottest core, ignoring probes that sit implausibly far above the rest. One stuck VRM or memory sensor among
+    /// ~60 CPU keys must not fake a 105° emergency and pin the fan at full speed; a genuinely hot CPU raises every
+    /// sensor, so the hottest real reading still wins.
+    static func robustMax(_ values: [Double]) -> Double? {
+        guard let raw = values.max() else { return nil }
+        let sorted = values.sorted()
+        let median = sorted[sorted.count / 2]
+        guard raw > median + 25 else { return raw }
+        return sorted.last { $0 <= median + 25 }
     }
 
     private static func float(_ key: String) -> Double? {

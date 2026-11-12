@@ -356,8 +356,11 @@ struct AccountQuotaGrid: View {
     let now: TimeInterval
     /// Recent quota holders whose sign-in is not confirmed right now; drawn dimmed with a "待确认" mark.
     var unconfirmedIDs: Set<String> = []
-    /// Estimated full-quota value per card ("≈ $410 / wk"), already formatted in the display currency.
-    var fullValue: [String: String] = [:]
+    /// Money view per quota window (consumed this cycle + estimated full value), keyed by
+    /// `AccountUsage.valueKey`. Both numbers use one accounting plane, so CPA and device logs never add up.
+    var values: [String: QuotaWindowValue] = [:]
+    /// Compact display-currency formatter; conversion rules stay with the caller.
+    var money: ([String: Double]) -> String = { _ in "—" }
     var open: (String) -> Void
 
     private let columns = [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)]
@@ -397,78 +400,14 @@ struct AccountQuotaGrid: View {
     private func tint(_ q: AccountQuotaObservation) -> Color { fresh(q) ? VG.heat(Int(q.usedPercent)) : .secondary }
 
     private func tile(_ card: AccountPresentation) -> some View {
-        let selection = AccountQuotaRingPresentation.select(card.currentQuotas(at: now))
-        let shown = selection.shown
-        let outer = selection.outer, inner = selection.inner
+        let selection = AccountQuotaRingPresentation.select(card.displayQuotas(at: now))
         let parts = card.title.components(separatedBy: " · ")
         let tool = parts.first ?? card.title
         let label = parts.count > 1 ? parts.dropFirst().joined(separator: " · ") : ""
         let devices = Set(card.sources.map { UsageHistory.device(of: $0) ?? "local" }).count
         return HStack(alignment: .center, spacing: 8) {
-            ZStack {
-                DualRing(outer: outer.map { $0.usedPercent / 100 }, inner: inner.map { $0.usedPercent / 100 },
-                         outerTint: outer.map(tint) ?? .secondary, innerTint: inner.map(tint) ?? .secondary, size: 36 * VG.scale)
-                Image(systemName: Self.symbol(tool)).font(.system(size: 9 * VG.scale, weight: .semibold)).foregroundStyle(Brand.color(tool))
-            }
-            .overlay(alignment: .bottomTrailing) {
-                if devices > 1 {
-                    Text("×\(devices)").font(.system(size: 11 * VG.scale, weight: .bold)).foregroundStyle(.white)
-                        .padding(.horizontal, 3).padding(.vertical, 0.5)
-                        .background(Capsule().fill(Brand.color(tool)))
-                        .offset(x: 4, y: 2)
-                        .help(L("\(devices) 台设备同一账号，额度已合并", "Same account on \(devices) devices; quota merged"))
-                }
-            }
-            VStack(alignment: .leading, spacing: 1) {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 4) {
-                        BrandTag(tool: tool)
-                        accountLabel(label.isEmpty ? tool : label, card: card).fixedSize()
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        BrandTag(tool: tool)
-                        accountLabel(label.isEmpty ? tool : label, card: card)
-                    }
-                }
-                if selection.needsPoolLabel, let pool = selection.pool {
-                    Text(AccountPresentation.poolLabel(pool)).font(VG.caption).foregroundStyle(.secondary)
-                        .lineLimit(1).truncationMode(.middle).help(AccountPresentation.poolLabel(pool))
-                }
-                ForEach(shown) { q in
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: 3) {
-                            quotaPercent(q)
-                            resetLabel(q)
-                        }.fixedSize()
-                        VStack(alignment: .leading, spacing: 1) {
-                            quotaPercent(q)
-                            resetLabel(q)
-                        }
-                    }
-                    .font(VG.caption).monospacedDigit()
-                    .help(q.pool + " · " + L("已用", "used") + String(format: " %.1f%%", q.usedPercent) + " · "
-                          + (QuotaPresentation.compactReset(to: q.resetAt, now: now).map { L("重置 ", "resets ") + $0 } ?? L("重置未知", "Reset unknown"))
-                          + (fresh(q) ? "" : "\n" + L("旧采样", "Older sample")))
-                }
-                if shown.isEmpty {
-                    Text(card.planTitle == nil ? L("额度 —", "Quota —") : L("额度暂不可读", "Quota not readable"))
-                        .font(VG.caption).foregroundStyle(.secondary)
-                }
-                if let value = fullValue[card.id] {
-                    HStack(spacing: 2) {
-                        Image(systemName: "equal.circle").font(.system(size: 8.5 * VG.scale, weight: .semibold))
-                        Text(L("满额 ", "Full ") + value)
-                    }
-                    .font(VG.caption).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.85)
-                    .help(L("按最近的用量折算：这段时间按 API 价花了多少 ÷ 额度涨了几个百分点。是估算，不是官方数字。",
-                            "From recent usage: API-priced spend in this stretch ÷ the percentage points it used. An estimate, not an official figure."))
-                }
-                if selection.additionalCount > 0 {
-                    Text(L("+\(selection.additionalCount) · 详情", "+\(selection.additionalCount) · Details"))
-                        .font(VG.caption).foregroundStyle(.secondary)
-                        .help(L("另有 \(selection.additionalCount) 个额度窗口，点击查看全部额度池", "\(selection.additionalCount) more quota windows; open details for all pools"))
-                }
-            }
+            tileRing(tool: tool, selection: selection, devices: devices)
+            tileDetails(card: card, selection: selection, tool: tool, label: label)
             Spacer(minLength: 0)
         }
         .frame(maxHeight: .infinity)
@@ -476,9 +415,99 @@ struct AccountQuotaGrid: View {
         .glassTile(tint: Brand.color(tool), padding: 7, radius: 12)
     }
 
+    /// The ring is its own view so the compiler and SwiftUI both diff a small subtree instead of one
+    /// 100-expression body. `AnyView` here used to erase the ring's identity on every 5 s tick.
+    private func tileRing(tool: String, selection: AccountQuotaRingPresentation.Selection,
+                          devices: Int) -> some View {
+        let outer = selection.outer, inner = selection.inner
+        return ZStack {
+            DualRing(outer: outer.map { $0.usedPercent / 100 }, inner: inner.map { $0.usedPercent / 100 },
+                     outerTint: outer.map(tint) ?? .secondary, innerTint: inner.map(tint) ?? .secondary, size: 36 * VG.scale)
+            Image(systemName: Self.symbol(tool)).font(.system(size: 9 * VG.scale, weight: .semibold)).foregroundStyle(Brand.color(tool))
+        }
+        .overlay(alignment: .bottomTrailing) {
+            if devices > 1 {
+                Text("×\(devices)").font(.system(size: 11 * VG.scale, weight: .bold)).foregroundStyle(.white)
+                    .padding(.horizontal, 3).padding(.vertical, 0.5)
+                    .background(Capsule().fill(Brand.color(tool)))
+                    .offset(x: 4, y: 2)
+                    .help(L("\(devices) 台设备同一账号，额度已合并", "Same account on \(devices) devices; quota merged"))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func tileDetails(card: AccountPresentation, selection: AccountQuotaRingPresentation.Selection,
+                             tool: String, label: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 4) {
+                    BrandTag(tool: tool)
+                    accountLabel(label.isEmpty ? tool : label, card: card).fixedSize()
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    BrandTag(tool: tool)
+                    accountLabel(label.isEmpty ? tool : label, card: card)
+                }
+            }
+            if let note = card.planNote, !note.isEmpty {
+                Text(note).font(.system(size: 8.5 * VG.scale)).foregroundStyle(.tertiary)
+                    .lineLimit(1).truncationMode(.tail).help(note)
+            }
+            if selection.needsPoolLabel, let pool = selection.pool {
+                Text(AccountPresentation.poolLabel(pool)).font(VG.caption).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle).help(AccountPresentation.poolLabel(pool))
+            }
+            quotaLines(selection)
+            if selection.shown.isEmpty {
+                Text(card.planTitle == nil ? L("额度 —", "Quota —") : L("额度暂不可读", "Quota not readable"))
+                    .font(VG.caption).foregroundStyle(.secondary)
+            }
+            if selection.additionalCount > 0 {
+                Text(L("+\(selection.additionalCount) · 详情", "+\(selection.additionalCount) · Details"))
+                    .font(VG.caption).foregroundStyle(.secondary)
+                    .help(L("另有 \(selection.additionalCount) 个额度窗口，点击查看全部额度池", "\(selection.additionalCount) more quota windows; open details for all pools"))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func quotaLines(_ selection: AccountQuotaRingPresentation.Selection) -> some View {
+        ForEach(selection.shown) { q in
+            quotaLine(q)
+        }
+    }
+
+    @ViewBuilder
+    private func quotaLine(_ q: AccountQuotaObservation) -> some View {
+        let help = q.pool + " · " + L("已用", "used") + String(format: " %.1f%%", q.usedPercent) + " · "
+            + (QuotaPresentation.compactReset(to: q.resetAt, now: now).map { L("重置 ", "resets ") + $0 } ?? L("重置未知", "Reset unknown"))
+            + (fresh(q) ? "" : "\n" + L("旧采样", "Older sample"))
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 3) {
+                quotaPercent(q)
+                resetLabel(q)
+            }.fixedSize()
+            VStack(alignment: .leading, spacing: 1) {
+                quotaPercent(q)
+                resetLabel(q)
+            }
+        }
+        .font(VG.caption).monospacedDigit()
+        .help(help)
+        quotaMoney(q)
+    }
+
     private func accountLabel(_ label: String, card: AccountPresentation) -> some View {
         HStack(spacing: 3) {
             Text(label).font(VG.font(12, .semibold)).lineLimit(1).truncationMode(.middle).help(card.title)
+            if let badge = card.planBadge {
+                Text(badge).font(.system(size: 8 * VG.scale, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4).padding(.vertical, 0.5)
+                    .background(Capsule().fill(Color.primary.opacity(0.06)))
+                    .lineLimit(1).fixedSize()
+            }
             if card.account == nil && card.planTitle == nil {
                 Image(systemName: "questionmark.circle").font(VG.caption).foregroundStyle(.secondary)
                     .help(L("账号未验证，未与其他设备合并", "Unverified account; not merged across devices"))
@@ -498,6 +527,71 @@ struct AccountQuotaGrid: View {
             Text(QuotaPresentation.compactReset(to: q.resetAt, now: now) ?? "—").foregroundStyle(.secondary).lineLimit(1)
             if !fresh(q) { Image(systemName: "clock").foregroundStyle(.secondary) }
         }
+    }
+
+    /// What this refill has cost so far and what the whole window is worth, right under its percentage.
+    /// The wording degrades instead of truncating, so the tile never ends in an ellipsis.
+    @ViewBuilder
+    private func quotaMoney(_ q: AccountQuotaObservation) -> some View {
+        // The lookup key names a pool and window, not a cycle: after a reset the stored numbers belong to the
+        // previous cycle until the next rebuild, so they are dropped instead of shown against the new percentage.
+        let value = values[AccountUsage.valueKey(account: q.account, pool: q.pool, window: q.window)]
+            .flatMap { AccountUsage.sameQuotaCycle($0.resetAt, q.resetAt) ? $0 : nil }
+        let consumed = value.flatMap { $0.consumedByCurrency.isEmpty ? nil : money($0.consumedByCurrency) }
+        let capacity = value.flatMap { $0.hasCapacity ? money($0.capacityByCurrency) : nil }
+        if let consumed, let capacity {
+            let used = L("已用 ≈", "used ≈") + consumed
+            let full = L("满额 ≈", "full ≈") + capacity
+            ViewThatFits(in: .horizontal) {
+                moneyText(used + L(" · ", " · ") + full, q, value)
+                moneyText("≈" + consumed + " / " + capacity, q, value)
+                moneyText(full, q, value)
+            }
+        } else if let capacity {
+            moneyText(L("满额 ≈", "full ≈") + capacity, q, value)
+        } else if let consumed {
+            moneyText(L("已用 ≈", "used ≈") + consumed, q, value)
+        }
+    }
+
+    private func moneyText(_ text: String, _ q: AccountQuotaObservation, _ value: QuotaWindowValue?) -> some View {
+        HStack(spacing: 2) {
+            Image(systemName: "equal.circle").font(.system(size: 8 * VG.scale, weight: .semibold))
+            Text(text)
+        }
+        .font(.system(size: 9.5 * VG.scale))
+        .foregroundStyle(fresh(q) ? AnyShapeStyle(.secondary) : AnyShapeStyle(Color.secondary.opacity(0.7)))
+        .lineLimit(1).minimumScaleFactor(0.8)
+        .help(moneyHelp(q, value))
+    }
+
+    private func moneyHelp(_ q: AccountQuotaObservation, _ value: QuotaWindowValue?) -> String {
+        guard let value else { return "" }
+        var lines: [String] = []
+        if !value.consumedByCurrency.isEmpty {
+            lines.append(L("本周期已用 ≈", "This cycle used ≈") + money(value.consumedByCurrency)
+                         + L("（API 等价 · \(value.consumedRequests) 次请求）", " (API-equivalent · \(value.consumedRequests) requests)"))
+        }
+        if value.hasCapacity {
+            lines.append(L("满额 ≈", "Full quota ≈") + money(value.capacityByCurrency))
+            let detail = AccountUsage.estimateDetail(value, format: money)
+            if !detail.isEmpty { lines.append(detail) }
+        }
+        if !value.covered && !value.consumedByCurrency.isEmpty {
+            lines.append(L("本周期开始前的记录不全，已用金额是下限。", "Part of this cycle predates collection, so the used amount is a lower bound."))
+        }
+        if value.unpricedRequests > 0 {
+            lines.append(L("\(value.unpricedRequests) 次请求的模型没有价格，金额偏低。", "\(value.unpricedRequests) requests have no price, so the amount is understated."))
+        }
+        if value.consumedByOrigin.count > 1 {
+            // Local CLIs never call the relay here, so the planes are different requests and are added.
+            let parts = value.consumedByOrigin.keys.sorted().map { origin -> String in
+                let name = origin == "cli" ? L("设备日志", "device logs") : origin == "cpa" ? "CPA" : origin.uppercased()
+                return name + " ≈" + money(value.consumedByOrigin[origin] ?? [:])
+            }
+            lines.append(L("构成：", "Composition: ") + parts.joined(separator: " + "))
+        }
+        return lines.joined(separator: "\n")
     }
 
     static func symbol(_ tool: String) -> String {
@@ -537,6 +631,39 @@ enum Brand {
         case "opencode": return "opencode"
         case "dsh": return "DSH"
         default: return tool
+        }
+    }
+
+    /// Model families used by the Statistics token breakdown. Model ids are verbose and mix routing
+    /// prefixes (`vm2api/`, `chatgpt-web/`), so the tile groups them by the brand users recognise.
+    static func family(forModel model: String) -> String {
+        let m = model.lowercased()
+        if m.contains("claude") || m.contains("anthropic") { return "Claude" }
+        if m.contains("gemini") || m.contains("antigravity") { return "Gemini" }
+        if m.contains("grok") { return "Grok" }
+        if m.contains("deepseek") || m.contains("dsh") { return "DeepSeek" }
+        if m.contains("glm") || m.contains("zhipu") || m.contains("z.ai") { return "GLM" }
+        if m.contains("kimi") || m.contains("moonshot") { return "Kimi" }
+        if m.contains("qwen") || m.contains("qwen3") { return "Qwen" }
+        if m.contains("minimax") { return "MiniMax" }
+        if m.contains("mimo") { return "MiMo" }
+        if m.contains("gpt") || m.contains("o3") || m.contains("o4") || m.contains("codex") || m.contains("openai") { return "OpenAI" }
+        return "Other"
+    }
+
+    static func color(forFamily family: String) -> Color {
+        switch family {
+        case "OpenAI": return color("Codex")
+        case "DeepSeek": return color("deepseek")
+        case "GLM": return color("glm")
+        case "Kimi": return color("kimi")
+        case "Gemini": return color("gemini")
+        case "Grok": return color("grok")
+        case "Qwen": return Color(red: 0.45, green: 0.35, blue: 0.95)
+        case "MiniMax": return Color(red: 0.95, green: 0.45, blue: 0.55)
+        case "MiMo": return Color(red: 0.96, green: 0.55, blue: 0.20)
+        case "Claude": return color("Claude")
+        default: return .secondary
         }
     }
 }
@@ -820,7 +947,7 @@ struct APIQuotaSection: View {
             HStack(spacing: 6) {
                 Text(L("API 与余额", "API & balances")).font(VG.caption.weight(.semibold)).foregroundStyle(.secondary)
                 VGInfoButton(title: L("API 与余额", "API & balances"),
-                             text: L("Grok / GLM / Gemini 是订阅，显示在上方订阅卡里。DeepSeek 余额来自 DSH 记账插件最后一次读到的值。经本机记账代理的 API key / Coding Plan（如 GLM、Kimi、OpenCode Go）显示额度或调用数；没有用量接口的套餐可在 ~/.config/vibedeck/plans.json 填写上限，按请求数估算。",
+                             text: L("Grok / GLM / Gemini 是订阅，显示在上方订阅卡里。DeepSeek 余额来自 DSH 记账插件最后一次读到的值（余额本身仍是人民币）。经本机记账代理的 API key / Coding Plan（如 GLM、Kimi、OpenCode Go）显示额度或调用数；没有用量接口的套餐可在 ~/.config/vibedeck/plans.json 填写上限，按请求数估算。上方的 API 等价金额统一折算成 USD，国产模型与 DSH 账本也包含在内。",
                                      "Grok / GLM / Gemini are subscriptions and appear in the subscription tiles above. The DeepSeek balance is the value DSH’s cost meter last read. API keys and coding plans routed through the local proxy (GLM, Kimi, OpenCode Go…) show their quota or request count; plans without a usage API can be estimated from request counts via ~/.config/vibedeck/plans.json."))
                 Spacer()
                 Button(action: openAPI) {

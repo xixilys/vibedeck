@@ -9,6 +9,10 @@ public struct StatsTabView: View {
     public let scope: DeviceScope
     public let hosts: [String]
     @State private var selectedCurrency = ""
+    /// Day key selected on the 14-day chart; the panel below shows that day instead of only totals.
+    @State private var selectedDay: String?
+    @State private var modelPeriod: ModelPeriod = .today
+    @State private var showAllModels = false
     public init(snapshot: UsageHistory.Snapshot, scope: DeviceScope = .all, hosts: [String] = []) {
         self.snapshot = snapshot; self.scope = scope; self.hosts = hosts
     }
@@ -129,8 +133,8 @@ public struct StatsTabView: View {
                     .help(snapshot.error)
             }
             trendTile
-            sourcesTile
             modelsTile
+            sourcesTile
             heatmap
             DisclosureGroup {
                 VStack(alignment: .leading, spacing: 8) {
@@ -185,8 +189,10 @@ public struct StatsTabView: View {
     private var trendTile: some View {
         let f = forecast
         let values = f?.recentCosts ?? []
+        let keys = f?.recentDays ?? []
         let currency = chartCurrency
         let total = values.reduce(0, +)
+        let selected = selectedDay.flatMap { day in keys.firstIndex(of: day) }
         return VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Text(L("近 14 天花费", "Last 14 days")).font(VG.caption).foregroundStyle(.secondary)
@@ -203,25 +209,126 @@ public struct StatsTabView: View {
                 if let f, f.dailyAverage > 0 {
                     Text(L("日均 ", "avg ") + Fmt.money(f.dailyAverage, currency)).font(VG.caption).foregroundStyle(.secondary).monospacedDigit()
                 }
+                Spacer(minLength: 4)
+                if let f {
+                    // Yesterday is one click away instead of being hidden behind the day-by-day list.
+                    Button { selectedDay = (selectedDay == yesterdayKey) ? nil : yesterdayKey } label: {
+                        Text(L("昨天 ", "yesterday ") + Fmt.money(f.yesterday, currency))
+                            .font(VG.caption).foregroundStyle(selectedDay == yesterdayKey ? .primary : .secondary)
+                            .monospacedDigit()
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("stats.yesterday")
+                    .help(L("查看昨天全天：点击下面的柱子也可以看任意一天", "Show yesterday; click any bar for another day"))
+                }
             }
             if values.isEmpty {
                 Text(snapshot.hasAnyPricing ? L("近 14 天没有可定价的用量", "No priced usage in the last 14 days") : L("价格表不可用，请查看模型价格", "Rates unavailable; check Model prices"))
                     .font(VG.caption).foregroundStyle(.secondary)
             } else {
                 GlassBars(values: values, labels: (f?.recentDays ?? []).map(shortDate), tint: Glass.money, tintEnd: Glass.moneyEnd,
+                          selected: selected, onSelect: { index in
+                              guard keys.indices.contains(index) else { return }
+                              selectedDay = (selectedDay == keys[index]) ? nil : keys[index]
+                          },
                           format: { Fmt.money($0, currency) })
                     .frame(height: 64)
                     .accessibilityLabel(L("近 14 天费用", "Cost over the last 14 days"))
                 HStack {
                     Text((f?.recentDays.first).map(shortDate) ?? "")
                     Spacer()
-                    Text(L("横线为日均 · 原记录费用", "Line = daily average · recorded cost"))
+                    Text(L("横线为日均 · 原记录费用 · 点柱子看当天", "Line = daily average · recorded cost · tap a bar for a day"))
                     Spacer()
                     Text(L("今天", "Today"))
                 }.font(.system(size: 9 * VG.scale)).foregroundStyle(.tertiary)
             }
+            if let selectedDay, keys.contains(selectedDay) {
+                daySummary(selectedDay)
+            }
         }
         .glassTile(tint: Glass.moneyEnd)
+    }
+
+    private var todayKey: String { UsageHistory.dayKey(timestamp: Date().timeIntervalSince1970) }
+    private var yesterdayKey: String {
+        let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: Date()) ?? Date()
+        return UsageHistory.dayKey(timestamp: yesterday.timeIntervalSince1970)
+    }
+
+    /// One day in full: money, tokens, requests, where the tokens went and which device paid.
+    /// Cost comes from the hourly ledger (so it matches the chart); tokens/requests come from the day buckets.
+    private func daySummary(_ key: String) -> some View {
+        let currency = chartCurrency
+        let sources = (snapshot.days.first { $0.date == key }?.sources ?? [:])
+            .filter { allows($0.key) && !UsageHistory.isProxySource($0.key) }
+        let tokens = sources.values.reduce(Int64(0)) { $0 + $1.tokenTotal }
+        let requests = sources.values.reduce(0) { $0 + $1.turns }
+        let cost = dailyCost[key]
+        let byTool = Dictionary(grouping: sources, by: { UsageHistory.cli(of: $0.key) })
+            .mapValues { group in group.reduce(Int64(0)) { $0 + $1.value.tokenTotal } }
+            .filter { $0.value > 0 }
+            .sorted { $0.value > $1.value }
+        let devices = deviceCosts(for: key, currency: currency)
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(dayTitle(key)).font(VG.font(12, .semibold))
+                if key == todayKey { Text(L("今天", "Today")).font(VG.caption).foregroundStyle(.tertiary) }
+                else if key == yesterdayKey { Text(L("昨天", "Yesterday")).font(VG.caption).foregroundStyle(.tertiary) }
+                Spacer(minLength: 4)
+                Text(cost.map { Fmt.money($0, currency) } ?? "—").font(VG.font(12, .semibold)).monospacedDigit()
+                Button { selectedDay = nil } label: { Image(systemName: "xmark.circle.fill").font(VG.caption) }
+                    .buttonStyle(.plain).foregroundStyle(.tertiary)
+                    .accessibilityLabel(L("关闭当天明细", "Close day details"))
+            }
+            Text(L("\(formatTokens(tokens)) token · \(requests) 次请求", "\(formatTokens(tokens)) tokens · \(requests) requests"))
+                .font(VG.caption).foregroundStyle(.secondary).monospacedDigit()
+            if !byTool.isEmpty {
+                Text(byTool.map { name, value in
+                    name + " " + String(format: "%.0f%%", Double(value) / Double(max(tokens, 1)) * 100)
+                }.joined(separator: " · "))
+                    .font(VG.caption).foregroundStyle(.secondary)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            }
+            if devices.count > 1 {
+                Text(L("设备 ", "devices ") + devices.prefix(3).map { name, value in
+                    deviceName(name) + " " + Fmt.money(value, currency)
+                }.joined(separator: " · "))
+                    .font(VG.caption).foregroundStyle(.tertiary)
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.primary.opacity(0.045)))
+    }
+
+    /// Per-device cost for one day, in the chart currency, honouring the device scope.
+    private func deviceCosts(for key: String, currency: String) -> [(String, Double)] {
+        switch scope {
+        case .local:
+            return [("local", snapshot.dailyCostByDevice["local"]?[currency]?[key] ?? 0)]
+        case .remote(let host):
+            let id = "remote:\(host)"
+            return [(id, snapshot.dailyCostByDevice[id]?[currency]?[key] ?? 0)]
+        case .all:
+            return snapshot.dailyCostByDevice.compactMap { id, currencies in
+                currencies[currency]?[key].map { (id, $0) }
+            }.filter { $0.1 > 0 }.sorted { $0.1 > $1.1 }
+        }
+    }
+
+    private func deviceName(_ id: String) -> String {
+        if id == "local" { return L("本机", "Local") }
+        if id.hasPrefix("remote:") { return RemoteCollector.displayName(for: String(id.dropFirst("remote:".count))) }
+        return RemoteCollector.displayName(for: id)
+    }
+
+    private func dayTitle(_ key: String) -> String {
+        let parts = key.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3, let date = Calendar.current.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2])) else { return key }
+        let formatter = DateFormatter()
+        formatter.locale = AppLanguage.current.locale
+        formatter.setLocalizedDateFormatFromTemplate("MMMdEEE")
+        return formatter.string(from: date)
     }
 
     /// Where the recorded money went, by device and tool, in one currency.
@@ -273,37 +380,236 @@ public struct StatsTabView: View {
         return cli + " · " + RemoteCollector.displayName(for: device)
     }
 
-    /// Most expensive models across the recorded history (all devices).
-    private var modelsTile: some View {
-        let currency = chartCurrency
-        let rows = snapshot.costByModel.compactMap { model, perCurrency -> (String, Double)? in
-            guard let value = perCurrency[currency], value > 0 else { return nil }
-            return (model, value)
-        }.sorted { $0.1 > $1.1 }
-        let top = Array(rows.prefix(5))
-        let peak = top.first?.1 ?? 1
-        return Group {
-            if !top.isEmpty && !scoped {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text(L("模型花费排行 · 累计", "Top models · all time")).font(VG.caption).foregroundStyle(.secondary)
-                    ForEach(Array(top.enumerated()), id: \.offset) { index, row in
-                        VStack(alignment: .leading, spacing: 3) {
-                            HStack {
-                                Text(row.0).font(VG.callout).lineLimit(1).truncationMode(.middle)
-                                Spacer(minLength: 4)
-                                Text(Fmt.money(row.1, currency)).font(VG.callout).monospacedDigit()
-                            }
-                            GeometryReader { geo in
-                                Capsule().fill(LinearGradient(colors: [Self.palette[index % Self.palette.count].opacity(0.6), Self.palette[index % Self.palette.count]],
-                                                              startPoint: .leading, endPoint: .trailing))
-                                    .frame(width: max(4, geo.size.width * CGFloat(row.1 / peak)))
-                            }.frame(height: 4)
-                        }
-                    }
-                }
-                .glassTile(tint: Glass.gpu)
+    // MARK: 模型 · token 分层
+
+    private enum ModelPeriod: String, CaseIterable {
+        case today, week, all
+        var title: String {
+            switch self {
+            case .today: return L("今日", "Today")
+            case .week: return L("7 天", "7 days")
+            case .all: return L("全部", "All")
             }
         }
+    }
+
+    private struct ModelUsageRow: Identifiable {
+        var id: String { model }
+        var model: String
+        var usage: UsageHistory.ModelTotals
+        var requests: Int
+        var costByCurrency: [String: Double]
+        var unpricedRequests: Int
+        var sources: Set<String>
+        var tokenTotal: Int64 { usage.tokenTotal }
+        var family: String { Brand.family(forModel: model) }
+        var freshInput: Int64 { max(0, usage.ctx - usage.cacheRead - usage.cacheWrite) }
+    }
+
+    /// Days feeding the model tile. `selectedDay` follows the 14-day chart; otherwise the period picker.
+    private var modelDays: Set<String>? {
+        if let selectedDay { return [selectedDay] }
+        switch modelPeriod {
+        case .today:
+            return [UsageHistory.dayKey(timestamp: Date().timeIntervalSince1970)]
+        case .week:
+            let calendar = Calendar.current
+            return Set((0..<7).compactMap { offset in
+                calendar.date(byAdding: .day, value: -offset, to: Date()).map { UsageHistory.dayKey(timestamp: $0.timeIntervalSince1970) }
+            })
+        case .all:
+            return nil
+        }
+    }
+
+    private func modelUsageRows() -> [ModelUsageRow] {
+        var collected: [String: (use: UsageHistory.ModelUse, sources: Set<String>)] = [:]
+        let days = modelDays
+        for (day, sources) in snapshot.modelUsageDays {
+            if let days, !days.contains(day) { continue }
+            for (source, models) in sources where allows(source) && !UsageHistory.isProxySource(source) {
+                for (model, use) in models {
+                    collected[model, default: (UsageHistory.ModelUse(), [])].use.merge(use)
+                    collected[model, default: (UsageHistory.ModelUse(), [])].sources.insert(source)
+                }
+            }
+        }
+        // One model can arrive under two names: its bare id from an agent's own logs and the
+        // provider-qualified id the gateway recorded ("gpt-6.1-sol" and "codex/gpt-6.1-sol").
+        // A model-usage tile wants one line per model, so fold the qualified ids into the bare
+        // id whenever the bare one is present too; a real vendor path such as
+        // "deepseek-ai/DeepSeek-V4.1-Flash-1017" has no bare twin and keeps its name.
+        let ids = Set(collected.keys)
+        var merged: [String: (use: UsageHistory.ModelUse, sources: Set<String>)] = [:]
+        for (model, entry) in collected {
+            let canonical = Self.canonicalModelId(model, among: ids)
+            merged[canonical, default: (UsageHistory.ModelUse(), [])].use.merge(entry.use)
+            merged[canonical, default: (UsageHistory.ModelUse(), [])].sources.formUnion(entry.sources)
+        }
+        return merged.map { model, entry in
+            ModelUsageRow(model: model, usage: entry.use.usage, requests: entry.use.requests,
+                          costByCurrency: entry.use.costByCurrency, unpricedRequests: entry.use.unpricedRequests,
+                          sources: entry.sources)
+        }
+        .filter { $0.tokenTotal > 0 }
+        .sorted { a, b in
+            if a.tokenTotal != b.tokenTotal { return a.tokenTotal > b.tokenTotal }
+            return a.model < b.model
+        }
+    }
+
+    static func selfTest() {
+        let ids: Set<String> = ["gpt-6.1-sol", "codex/gpt-6.1-sol", "chatgpt-web/gpt-6-sol",
+                                "deepseek-ai/DeepSeek-V4.1-Flash-1017"]
+        precondition(canonicalModelId("codex/gpt-6.1-sol", among: ids) == "gpt-6.1-sol",
+                     "a qualified id folds into the bare id when both exist")
+        precondition(canonicalModelId("chatgpt-web/gpt-6-sol", among: ids) == "chatgpt-web/gpt-6-sol",
+                     "a qualified id with no bare twin keeps its provider name")
+        precondition(canonicalModelId("deepseek-ai/DeepSeek-V4.1-Flash-1017", among: ids)
+                     == "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+                     "a real vendor path is not mistaken for a provider prefix")
+        precondition(canonicalModelId("plain-model", among: ids) == "plain-model")
+    }
+
+    /// The name a model is counted under in this tile: the bare id when it exists, so that
+    /// "codex/gpt-6.1-sol" and "gpt-6.1-sol" are one line instead of two.
+    static func canonicalModelId(_ model: String, among ids: Set<String>) -> String {
+        var current = model
+        var hops = 0
+        while hops < 3, let slash = current.firstIndex(of: "/") {
+            let suffix = String(current[current.index(after: slash)...])
+            guard !suffix.isEmpty, ids.contains(suffix) else { break }
+            current = suffix
+            hops += 1
+        }
+        return current
+    }
+
+    private func modelMoney(_ costs: [String: Double]) -> String {
+        guard !costs.isEmpty else { return L("未定价", "Unpriced") }
+        return MoneyDisplay.format(costs, mode: .usd, quote: nil).text
+    }
+
+    /// One model line: tokens first (the question this tile answers), then where those tokens went.
+    private func modelRow(_ row: ModelUsageRow, peak: Int64) -> some View {
+        let tint = Brand.color(forFamily: row.family)
+        let breakdown = L("输入 \(formatTokens(row.freshInput)) · 缓存 \(formatTokens(row.usage.cacheRead + row.usage.cacheWrite)) · 输出 \(formatTokens(row.usage.out))",
+                          "in \(formatTokens(row.freshInput)) · cache \(formatTokens(row.usage.cacheRead + row.usage.cacheWrite)) · out \(formatTokens(row.usage.out))")
+            + (row.usage.think > 0 ? L(" · 思考 \(formatTokens(row.usage.think))", " · think \(formatTokens(row.usage.think))") : "")
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 5) {
+                Circle().fill(tint).frame(width: 6, height: 6)
+                Text(row.model).font(VG.font(11.5, .medium)).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text(formatTokens(row.tokenTotal)).font(VG.font(11.5, .semibold)).monospacedDigit()
+                Text(modelMoney(row.costByCurrency)).font(VG.font(10)).monospacedDigit()
+                    .foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.8)
+            }
+            HStack(spacing: 5) {
+                Text(breakdown).font(VG.font(9)).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.85)
+                Spacer(minLength: 4)
+                Text(L("\(row.requests) 次", "\(row.requests) req")).font(VG.font(9)).foregroundStyle(.tertiary).monospacedDigit()
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.06))
+                    Capsule().fill(tint.opacity(0.75))
+                        .frame(width: max(3, geo.size.width * CGFloat(Double(row.tokenTotal) / Double(max(peak, 1)))))
+                }
+            }.frame(height: 3)
+        }
+        .padding(.vertical, 2)
+        .help(L("\(row.model) · \(breakdown) · \(row.requests) 次请求 · API 等价 \(modelMoney(row.costByCurrency))",
+                "\(row.model) · \(breakdown) · \(row.requests) requests · API equivalent \(modelMoney(row.costByCurrency))")
+              + (row.unpricedRequests > 0 ? "\n" + L("\(row.unpricedRequests) 次请求没有价格，金额偏低", "\(row.unpricedRequests) unpriced requests understate the cost") : ""))
+    }
+
+    /// Token totals grouped by recognisable brand, so the strip answers "which family ate the quota".
+    private func familyParts(_ rows: [ModelUsageRow]) -> [SegmentBar.Part] {
+        var byFamily: [String: Int64] = [:]
+        for row in rows { byFamily[row.family, default: 0] += row.tokenTotal }
+        let top = byFamily.sorted { $0.value > $1.value }
+        let others = top.dropFirst(4).reduce(Int64(0)) { $0 + $1.value }
+        var parts = top.prefix(4).map { family, tokens in
+            SegmentBar.Part(id: family, value: Double(tokens), tint: Brand.color(forFamily: family))
+        }
+        if others > 0 { parts.append(.init(id: L("其他", "Other"), value: Double(others), tint: .secondary)) }
+        return parts
+    }
+
+    private var modelsTile: some View {
+        let rows = modelUsageRows()
+        let shown = showAllModels ? rows : Array(rows.prefix(5))
+        let totalTokens = rows.reduce(Int64(0)) { $0 + $1.tokenTotal }
+        let totalCost = rows.reduce(into: [String: Double]()) { result, row in
+            for (currency, value) in row.costByCurrency { result[currency, default: 0] += value }
+        }
+        let peak = rows.first?.tokenTotal ?? 1
+        let label = selectedDay.map(shortDate) ?? modelPeriod.title
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 5) {
+                Text(L("模型用量", "Model usage")).font(VG.caption).foregroundStyle(.secondary)
+                VGInfoButton(title: L("模型 token 分层", "Model token breakdown"),
+                             text: L("按模型汇总 token，而不是只按 Codex / Claude 两个来源。范围跟随统计页的设备筛选，并排除代理镜像（避免和 CLI 日志重复）。金额是按 API 官方价折算的等价花费：国产模型的人民币价会按参考汇率折成美元，DSH 账本的人民币实付也折算成美元；汇率不可用时保留原币。未定价模型只计 token，不计金额。",
+                                     "Tokens are grouped by model, not only by the Codex / Claude source. The device filter applies and proxy mirrors are excluded to avoid double counting. Money is API-equivalent pricing; CNY-priced domestic models and DSH’s CNY ledger are converted at the reference rate, and stay in their original currency if no rate is available. Unpriced models still count tokens but not money."))
+                Spacer(minLength: 4)
+                if selectedDay != nil {
+                    Button { selectedDay = nil } label: {
+                        Text(L("跟随范围", "Follow range")).font(VG.caption).foregroundStyle(.secondary)
+                    }.buttonStyle(.plain).help(L("取消图表当天的选择", "Clear the chart’s day selection"))
+                }
+                Menu {
+                    ForEach(ModelPeriod.allCases, id: \.rawValue) { period in
+                        Button {
+                            selectedDay = nil
+                            modelPeriod = period
+                        } label: {
+                            if modelPeriod == period && selectedDay == nil { Label(period.title, systemImage: "checkmark") }
+                            else { Text(period.title) }
+                        }
+                    }
+                } label: {
+                    GlassChipLabel(icon: "calendar", text: label)
+                }
+                .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+                .accessibilityIdentifier("stats.modelRange")
+            }
+            if rows.isEmpty {
+                Text(L("这个范围还没有模型用量记录", "No model usage in this range")).font(VG.caption).foregroundStyle(.secondary)
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(formatTokens(totalTokens))
+                        .font(.system(size: 20 * VG.scale, weight: .bold, design: .rounded)).monospacedDigit()
+                        .foregroundStyle(LinearGradient(colors: [Glass.gpu, Glass.moneyEnd], startPoint: .leading, endPoint: .trailing))
+                        .lineLimit(1).minimumScaleFactor(0.8)
+                    Text(L("token · \(rows.count) 个模型", "tokens · \(rows.count) models")).font(VG.caption).foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    Text(modelMoney(totalCost)).font(VG.font(11, .semibold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.8)
+                }
+                if rows.count > 1 {
+                    SegmentBar(parts: familyParts(rows), height: 5)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    ForEach(shown) { row in modelRow(row, peak: peak) }
+                }
+                if rows.count > 5 {
+                    Button { showAllModels.toggle() } label: {
+                        HStack(spacing: 3) {
+                            Text(showAllModels ? L("收起", "Show less") : L("全部 \(rows.count) 个模型", "All \(rows.count) models"))
+                            Image(systemName: showAllModels ? "chevron.up" : "chevron.down")
+                        }
+                        .font(VG.caption).foregroundStyle(.secondary).contentShape(Rectangle())
+                    }.buttonStyle(.plain).accessibilityIdentifier("stats.allModels")
+                }
+                if rows.contains(where: { $0.unpricedRequests > 0 }) {
+                    Text(L("部分模型没有价格：token 计数完整，金额是下限。", "Some models have no rate: tokens are complete, money is a lower bound."))
+                        .font(.system(size: 9 * VG.scale)).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+        .glassTile(tint: Glass.gpu)
+        .accessibilityIdentifier("stats.models")
     }
 
     // MARK: 今日模型表现

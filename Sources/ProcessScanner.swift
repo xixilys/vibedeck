@@ -1017,14 +1017,18 @@ public final class ProcessScanner {
         return c
     }
 
-    // MARK: 快层 8s；面板关闭时慢层 30s，打开时 8s
+    // MARK: 快层 8s；面板关闭时慢层 60s，打开时 8s
 
     private var slowReport: ScanReport?
     private var lastSlowScanAt: TimeInterval?
+    /// Cold-start cost breakdown of the last slow scan (seconds); only read by `--bench-process`.
+    public private(set) var lastSlowProfile: [String: Double] = [:]
 
     static func slowScanDue(last: TimeInterval?, now: TimeInterval, panelVisible: Bool, force: Bool = false) -> Bool {
         guard let last, !force else { return true }
-        return now - last >= (panelVisible ? 8 : 30)
+        // Closed-panel slow work every 60 s halves the process-table/token scan; the 8 s status timer still
+        // reads the cheap fast layer, so the menu bar stays current.
+        return now - last >= (panelVisible ? 8 : 60)
     }
 
     public func scan(refreshRemote: Bool = true, panelVisible: Bool = false, forceSlow: Bool = false) -> ScanReport {
@@ -1083,9 +1087,18 @@ public final class ProcessScanner {
         if refreshSlow {
             report.activeMCPProcessCount = 0
             report.activeMCPTotalMemMB = 0
+            var slowLap = Date().timeIntervalSinceReferenceDate
+            var profile: [String: Double] = [:]
+            func lap(_ name: String) {
+                let now = Date().timeIntervalSinceReferenceDate
+                profile[name] = now - slowLap
+                slowLap = now
+            }
             // 7. 仅当确有孤儿候选时查询监听端口；无候选的常见路径不运行 lsof。
             let procs = readProcs()
+            lap("procs")
             let counts = countSessions(procs)
+            lap("sessions")
             let allKeywords = serviceDefinitions.map { $0.key } + ["_npx", "mcp"]
             func isRunner(_ lower: String) -> Bool {
                 lower.contains("node") || lower.contains("npm") || lower.contains("python") || lower.contains("uv")
@@ -1095,6 +1108,7 @@ public final class ProcessScanner {
                 return $0.ppid == 1 && isRunner(lower) && allKeywords.contains(where: { lower.contains($0) })
             }
             let listeningPids = hasOrphanCandidates ? listeningProcesses() : []
+            lap("listening")
             for p in procs.values where p.ppid != 1 {
                 let lower = p.cmd.lowercased()
                 if ProcessScanner.isClaudeCLISession(cmd: p.cmd) || CodexProcessMonitor.role(command: p.cmd) != nil
@@ -1165,16 +1179,22 @@ public final class ProcessScanner {
 
             // 10. Token 遥测 + 11. 各平台档位/额度 + 12. API Key 调用
             report.tokens = scanTokens()
+            lap("tokens")
             report.detectedLLMs = withQuotaSamples(detectAllLLMRuntimes(counts))
+            lap("llms")
             report.codexProcesses = counts.codexProcesses
             report.codexProcessDevices = processReadSucceeded && !codexProcessMonitor.inventoryLimited ? ["local"] : []
             report.codexProcessErrors = !processReadSucceeded ? ["local": L("无法读取本机进程表", "Local process table unavailable")] :
                 codexProcessMonitor.inventoryLimited ? ["local": L("部分 Codex 进程已退出或无法读取", "Some Codex processes exited or could not be read")] : [:]
             report.accountPresence = accountPresenceCollector.snapshot(force: forceSlow)
+            lap("presence")
             report.api = scanAPI()
+            lap("api")
             report.cliUsage = scanCLIUsage(claude: report.tokens)
+            lap("cliUsage")
             slowReport = report
             lastSlowScanAt = now
+            lastSlowProfile = profile
         }
         report.remoteHosts = RemoteCollector.devices()
         remoteLock.lock()
@@ -1941,7 +1961,7 @@ public final class ProcessScanner {
         for host in codexRemoteHosts {
             remoteLock.lock()
             let status = remoteDeviceStatus[host] ?? RemoteDeviceStatus()
-            let due = !quotaInFlight.contains(host) && (force || now - (status.lastAttempt ?? 0) >= 60)
+            let due = !quotaInFlight.contains(host) && (force || now - (status.lastAttempt ?? 0) >= 120)
             if due {
                 quotaInFlight.insert(host)
                 var updated = status
@@ -2093,7 +2113,7 @@ public final class ProcessScanner {
         guard (json["code"] as? NSNumber)?.intValue == 200, let data = json["data"] as? [String: Any] else { return nil }
         func seconds(_ l: [String: Any]) -> Double {
             let unit = (l["unit"] as? NSNumber)?.intValue ?? 0, number = (l["number"] as? NSNumber)?.doubleValue ?? 1
-            return ([3: 3600, 4: 86400, 5: 86400, 6: 7 * 86400, 7: 30 * 86400][unit] ?? 0) * number
+            return ([3: 3600.0, 4: 86400.0, 5: 86400.0, 6: 604800.0, 7: 2592000.0][unit] ?? 0.0) * number
         }
         var quota = GLMQuota(key: key, tier: "Coding Plan")
         if let level = data["level"] as? String, !level.isEmpty { quota.tier = "Coding " + level.capitalized }
@@ -2385,14 +2405,20 @@ public final class ProcessScanner {
 
     // MARK: Token 遥测（增量解析，requestId 去重）
 
-    private func parseAssistantLine(_ line: Substring) -> InteractionRecord? {
+    private func parseAssistantLine(_ line: Substring, retainSince: TimeInterval? = nil,
+                                    allowedDates: Set<String>? = nil) -> InteractionRecord? {
+        // The cheap substrings reject user/tool lines before any date or JSON work.
         guard line.contains("\"type\":\"assistant\""), line.contains("\"usage\":"),
+              !(allowedDates.map { !Self.hasRetainedTimestamp(line, allowedDates: $0) } ?? false),
               let data = line.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let msg = json["message"] as? [String: Any],
               let usage = msg["usage"] as? [String: Any] else { return nil }
         let model = msg["model"] as? String ?? ""
         if model.contains("synthetic") || json["isApiErrorMessage"] as? Bool == true { return nil }
+        if let retainSince, let stamp = json["timestamp"] as? String, let parsed = parseISO(stamp), parsed < retainSince {
+            return nil
+        }
         let id = (json["requestId"] as? String) ?? (msg["id"] as? String) ?? (json["uuid"] as? String) ?? UUID().uuidString
         let inp = usage["input_tokens"] as? Int ?? 0
         let cRead = usage["cache_read_input_tokens"] as? Int ?? 0
@@ -2405,8 +2431,16 @@ public final class ProcessScanner {
         )
     }
 
+    /// A cheap reject for old fork-copy lines: assistant rows always carry an ISO timestamp. Rows without one
+    /// still go through the full parser so the mtime fallback keeps its old behaviour.
+    private static func hasRetainedTimestamp(_ line: Substring, allowedDates: Set<String>) -> Bool {
+        guard let marker = line.range(of: "\"timestamp\":\"") else { return true }
+        return allowedDates.contains(String(line[marker.upperBound...].prefix(10)))
+    }
+
     /// jsonl 是 append-only：只解析上次 offset 之后新增的完整行；文件变小则整体重解析
-    private func refreshFileState(path: String, mtime: TimeInterval, size: UInt64) -> FileParseState {
+    private func refreshFileState(path: String, mtime: TimeInterval, size: UInt64,
+                                  retainSince: TimeInterval, allowedDates: Set<String>) -> FileParseState {
         var state = fileStates[path] ?? FileParseState()
         if state.mtime == mtime && state.size == size { return state }
 
@@ -2417,20 +2451,38 @@ public final class ProcessScanner {
         if size < state.size || head != state.head { state = FileParseState() }
         state.head = head
         do { try fh.seek(toOffset: state.parsedOffset) } catch { return state }
-        let data = fh.readDataToEndOfFile()
 
-        if let lastNL = data.lastIndex(of: 0x0A) {
-            let chunk = data[data.startIndex...lastNL]
-            let text = String(decoding: chunk, as: UTF8.self)   // lossy：坏字节只毁一行，不丢整块
-            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-                if var rec = parseAssistantLine(line) {
-                    if rec.timestamp == 0 { rec.timestamp = mtime }
-                    // 同 requestId 流式分块会写多行，取 token 最多的那条（与历史统计口径一致）
-                    if let old = state.turns[rec.id], old.contextTokens + old.outputTokens > rec.contextTokens + rec.outputTokens { continue }
-                    state.turns[rec.id] = rec
+        // 流式按行解析：不再把整个文件读成 Data + String。一个 575MB 的日志会因此同时存在两份
+        // （Data 和 String），再加 JSON 的临时对象，冷启动峰值能到 4GB。这里一次只保留 2MB 块。
+        let chunkSize = 2 << 20
+        var carry = Data()
+        while true {
+            let chunk = (try? fh.read(upToCount: chunkSize)) ?? Data()
+            if chunk.isEmpty { break }
+            var buffer = carry
+            buffer.append(chunk)
+            guard let lastNL = buffer.lastIndex(of: 0x0A) else {
+                // 单行比块还大：先留着，等下一块；正常 JSONL 不会出现。
+                carry = buffer
+                continue
+            }
+            let complete = buffer[..<lastNL]
+            let consumed = UInt64(complete.count + 1)
+            for lineSlice in complete.split(separator: 0x0A, omittingEmptySubsequences: true) {
+                autoreleasepool {
+                    let line = String(decoding: lineSlice, as: UTF8.self)
+                    guard !line.isEmpty else { return }
+                    if var rec = parseAssistantLine(line[...], retainSince: retainSince, allowedDates: allowedDates) {
+                        if rec.timestamp == 0 { rec.timestamp = mtime }
+                        // 同 requestId 流式分块会写多行，取 token 最多的那条（与历史统计口径一致）
+                        if let old = state.turns[rec.id],
+                           old.contextTokens + old.outputTokens > rec.contextTokens + rec.outputTokens { return }
+                        state.turns[rec.id] = rec
+                    }
                 }
             }
-            state.parsedOffset += UInt64(chunk.count)
+            state.parsedOffset += consumed
+            carry = Data(buffer[(lastNL + 1)...])
         }
         state.mtime = mtime
         state.size = size
@@ -2503,6 +2555,16 @@ public final class ProcessScanner {
         var byId: [String: InteractionRecord] = [:]   // 跨文件再去重（--fork-session 会把历史复制进新文件）
         var idPath: [String: String] = [:]            // 这轮最终算在哪个文件上 → 用来归因到项目目录
         let startOfToday = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970
+        // Only today's turns are counted; recent cards need yesterday's too. Fork/rewind copies embed weeks of
+        // history in files touched today, so skip JSON decoding for older lines with a date-string prefilter.
+        let retainSince = startOfToday - 86400
+        var allowedDates = Set<String>()
+        let utc = TimeZone(secondsFromGMT: 0)!
+        var dayProbe = retainSince - 86400
+        while dayProbe <= now + 86400 {
+            allowedDates.insert(UsageHistory.dayKey(timestamp: dayProbe, timeZone: utc))
+            dayProbe += 86400
+        }
         let files = claudeLogIndex.snapshots(roots: ["\(home)/.claude/projects", "\(home)/.config/claude/projects"],
                                               horizon: horizon, now: now)
         let codexFiles = codexHotFiles(startOfToday: startOfToday).compactMap(LogFileStamp.read)
@@ -2512,7 +2574,8 @@ public final class ProcessScanner {
         for file in files {
             let path = file.path
             seen.insert(path)
-            for (id, rec) in refreshFileState(path: path, mtime: file.mtime, size: file.size).turns {
+            for (id, rec) in refreshFileState(path: path, mtime: file.mtime, size: file.size,
+                                               retainSince: retainSince, allowedDates: allowedDates).turns {
                 if let old = byId[id], old.contextTokens + old.outputTokens >= rec.contextTokens + rec.outputTokens { continue }
                 byId[id] = rec
                 idPath[id] = path
@@ -2853,10 +2916,19 @@ public final class ProcessScanner {
         }
 
         func row(for model: String) -> Row? {
-            let m = model.lowercased()
-            if let exact = rows[m] { return exact }
-            // 最长前缀命中："glm-4.7" 能覆盖 "glm-4.7-flash"；取最长的那条，避免被短名抢走
-            return rows.filter { m.hasPrefix($0.key) }.max { $0.key.count < $1.key.count }?.value
+            let raw = model.lowercased()
+            // DSH / opencode / routed logs carry provider prefixes (`deepseek/deepseek-flash`,
+            // `zhipu/glm-5.3`). The catalog normalises those; the user table must too, otherwise a
+            // perfectly good local price row silently becomes "unpriced".
+            let normalized = PricingCatalog.normalize(model)
+            for m in normalized == raw ? [raw] : [raw, normalized] {
+                if let exact = rows[m] { return exact }
+                // 最长前缀命中："glm-4.7" 能覆盖 "glm-4.7-flash"；取最长的那条，避免被短名抢走
+                if let hit = rows.filter({ m.hasPrefix($0.key) }).max(by: { $0.key.count < $1.key.count }) {
+                    return hit.value
+                }
+            }
+            return nil
         }
 
         /// 该模型计价用的币种；命中不了就退回表级默认。
@@ -3057,13 +3129,34 @@ public final class ProcessScanner {
 
     /// 每个额度窗口按时间记若干 (时刻, 已用%)，用来算近期速度。
     /// 键里带重置点 → 窗口一换就是新键，天然不会把上个窗口的样本混进来。
-    /// 落盘 `~/.config/vibedeck/quota-samples.json`，重启不丢；只留 6 小时，文件几十 KB。
+    /// 落盘 `~/.config/vibedeck/quota-samples.json`，重启不丢。周额度的满额估算需要长跨度：近 6 小时一分钟一个点，
+    /// 6–48 小时十分钟一个点，2–7 天一小时一个点；再老就丢。分层保留后文件仍在几百 KB。
     private var qsamples: [String: [(t: TimeInterval, pct: Int)]] = [:]
     private var qsamplesLoaded = false
     private var qsamplesSavedAt: TimeInterval = 0
     private var samplesPath: String { "\(home)/.config/vibedeck/quota-samples.json" }
-    private static let sampleKeep: TimeInterval = 6 * 3600
+    private static let sampleKeep: TimeInterval = 7 * 24 * 3600
+    private static let sampleKeepDense: TimeInterval = 6 * 3600
+    private static let sampleKeepMid: TimeInterval = 48 * 3600
     private static let sampleEvery: TimeInterval = 55          // 扫描每 8s 一次，别记那么密
+    /// One sample per band: 1 min (last 6 h), 10 min (6–48 h), 1 h (2–7 days). The oldest sample survives so the
+    /// baseline keeps its full span.
+    static func downsample(_ samples: [(t: TimeInterval, pct: Int)], now: TimeInterval) -> [(t: TimeInterval, pct: Int)] {
+        guard samples.count > 1 else { return samples }
+        var kept: [(t: TimeInterval, pct: Int)] = []
+        var previous: TimeInterval?
+        for sample in samples.reversed() {
+            let age = now - sample.t
+            guard age <= sampleKeep else { continue }
+            let gap: TimeInterval = age <= sampleKeepDense ? 0 : age <= sampleKeepMid ? 600 : 3600
+            let oldest = sample.t == samples.first?.t
+            if gap == 0 || oldest || previous == nil || (previous! - sample.t) >= gap {
+                kept.append(sample)
+                previous = sample.t
+            }
+        }
+        return kept.reversed()
+    }
 
     private func loadSamples() {
         guard !qsamplesLoaded else { return }
@@ -3101,7 +3194,7 @@ public final class ProcessScanner {
         var arr = qsamples[key] ?? []
         if arr.last.map({ now - $0.t >= Self.sampleEvery }) ?? true {
             arr.append((t: now, pct: pct))
-            arr.removeAll { now - $0.t > Self.sampleKeep }
+            arr = Self.downsample(arr, now: now)
             qsamples[key] = arr
             // 键会随窗口重置而变，老键留着没用 —— 顺手清掉超过保留期的整条
             qsamples = qsamples.filter { !($0.value.last.map { now - $0.t > Self.sampleKeep } ?? true) }

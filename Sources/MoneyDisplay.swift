@@ -33,6 +33,16 @@ struct ExchangeQuote: Codable, Equatable {
         return age >= -86400 && age <= 7 * 86400
     }
 
+    /// The same on-disk quote the UI uses, read by background accounting so API-equivalent amounts can be
+    /// normalised to USD without touching the main thread.
+    static func cached(home: String, now: TimeInterval = Date().timeIntervalSince1970) -> Self? {
+        let url = URL(fileURLWithPath: home + "/.config/vibedeck/exchange-rate.json")
+        guard let data = try? Data(contentsOf: url),
+              let quote = try? JSONDecoder().decode(Self.self, from: data),
+              quote.isUsable(at: now) else { return nil }
+        return quote
+    }
+
     static func parseECB(_ data: Data, fetchedAt: TimeInterval = Date().timeIntervalSince1970) -> Self? {
         final class Reader: NSObject, XMLParserDelegate {
             var date: String?
@@ -85,6 +95,40 @@ enum MoneyDisplay {
         return result.isFinite ? result : nil
     }
 
+    /// Tile-sized amount: currency symbol, grouped integer, thousands abbreviated. Two decimals are noise
+    /// next to a percentage and used to push the quota tile line into an ellipsis.
+    static func compact(_ value: Double, currency: String) -> String {
+        guard value.isFinite else { return "—" }
+        let code = currency.uppercased()
+        let symbol = ["USD": "$", "CNY": "¥", "EUR": "€", "JPY": "¥", "GBP": "£"][code]
+        func scaled(_ number: Double) -> String {
+            let formatter = CachedNumberFormatter.decimal(locale: AppLanguage.current.locale,
+                                                          fraction: number < 10 ? 1 : 0)
+            return formatter.string(from: NSNumber(value: number)) ?? String(format: "%.0f", number)
+        }
+        let magnitude = abs(value)
+        let body: String
+        if magnitude >= 10_000 { body = scaled((value / 1_000).rounded()) + "k" }
+        else if magnitude >= 1_000 { body = scaled(value.rounded()) }
+        else if magnitude < 0.01 { body = "0" }
+        else { body = scaled(value) }
+        guard let symbol else { return code + " " + body }
+        return symbol + body
+    }
+
+    /// Compact, optionally converted amount for a quota tile. Original currencies stay separate when no
+    /// reference rate exists, exactly like `format`, but the text stays short enough for one line.
+    static func compactFormat(_ values: [String: Double], mode: DisplayCurrency, quote: ExchangeQuote?,
+                              at now: TimeInterval = Date().timeIntervalSince1970) -> String {
+        guard !values.isEmpty, values.values.allSatisfy({ $0.isFinite }) else { return "—" }
+        let original = values.keys.sorted().map { compact(values[$0]!, currency: $0) }.joined(separator: " + ")
+        guard let target = mode.code else { return original }
+        let needsConversion = values.contains { $0.key.uppercased() != target && $0.value != 0 }
+        guard needsConversion else { return compact(values.values.reduce(0, +), currency: target) }
+        guard let total = convertedValue(values, to: target, quote: quote, at: now) else { return original }
+        return compact(total, currency: target)
+    }
+
     static func format(_ values: [String: Double], mode: DisplayCurrency, quote: ExchangeQuote?, at now: TimeInterval = Date().timeIntervalSince1970) -> Presentation {
         guard !values.isEmpty, values.values.allSatisfy({ $0.isFinite }) else { return Presentation(text: "—", detail: "") }
         let original = values.keys.sorted().map { amount(values[$0]!, currency: $0) }.joined(separator: " + ")
@@ -113,6 +157,16 @@ enum MoneyDisplay {
         precondition(format(["CNY": 10], mode: .usd, quote: nil, at: now).conversionUnavailable)
         precondition(!format(["USD": 10], mode: .usd, quote: nil, at: now).converted)
         precondition(format(["USD": 10], mode: .cny, quote: quote, at: now).text.hasPrefix("≈CNY"))
+        // Tile amounts: no cents, symbol, and thousands abbreviated so the quota line fits.
+        precondition(compact(412.34, currency: "USD") == "$412")
+        precondition(compact(8.25, currency: "USD") == "$8.3")
+        precondition(compact(0.004, currency: "USD") == "$0")
+        precondition(compact(10_400, currency: "USD") == "$10k")
+        precondition(compact(123.4, currency: "AUD") == "AUD 123")
+        precondition(compact(.nan, currency: "USD") == "—")
+        precondition(compactFormat(["USD": 10], mode: .usd, quote: nil) == "$10")
+        precondition(compactFormat(["CNY": 10], mode: .usd, quote: nil) == "¥10")
+        precondition(compactFormat(["CNY": quote.cnyPerUSD * 5], mode: .usd, quote: quote, at: now).hasPrefix("$"))
         precondition(!quote.isUsable(at: now + 8 * 86400))
         precondition(ExchangeQuote.parseECB(Data("<Cube time='2026-10-22'><Cube currency='USD' rate='1'/></Cube>".utf8), fetchedAt: now) == nil)
     }

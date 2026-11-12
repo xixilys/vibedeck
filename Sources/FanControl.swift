@@ -267,6 +267,8 @@ struct FanControlCard: View {
     @State private var checkingInstallation = true
     @State private var serviceUnavailable = false
     @ObservedObject private var thermostat = FanThermostat.shared
+    /// The monitor samples even before the thermostat's first frame; the card can show a temperature immediately.
+    @ObservedObject private var monitor = SystemMonitor.shared
     private let ticker = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
 
     private var range: ClosedRange<Double> {
@@ -386,12 +388,16 @@ struct FanControlCard: View {
                 Image(systemName: "thermometer.medium").font(VG.caption).foregroundStyle(Glass.thermal(thermostat.lastTemperature))
                 Text(L("智能温控", "Smart cooling")).font(VG.body)
                 VGInfoButton(title: L("智能温控", "Smart cooling"),
-                             text: L("根据最高 CPU 核心温度（中值与约 10 秒平滑）调速，不是 CPU 平均温度；默认目标 80°。正常每秒最多升 30 RPM、降 12 RPM。目标不是温度上限；持续负载可能需要高转速或全速。原始温度达到 105°、平滑温度高于目标 15°、温度中断 30 秒或控制失败时请求系统自动；恢复失败会显示错误并重试。高温回退后需降至原始不高于 100° 与目标+10°中较低值，且平滑不高于目标+10°，持续有安全读数 30 秒才重试智能温控。关闭与退出也需确认系统自动；退出失败会保留应用。需要已授权的风扇服务。",
-                                     "Uses the hottest CPU core (median plus about 10 seconds of smoothing), not the CPU average; default target 80°. Normal ramps: up to +30 / −12 RPM per second. The target is not a temperature limit; sustained load may need high or full speed. Raw 105°, smoothed target +15°, 30 seconds without temperature, or a control failure requests system Auto; failures are shown and retried. After heat fallback, raw must stay at or below the lower of 100° and target +10°, and smoothed at or below target +10°, with 30 seconds of fresh safe readings before Smart retries. Disabling and quitting also require Auto acknowledgement; failed quit leaves the app running. Requires the authorized fan service."))
+                             text: L("根据最高 CPU 核心温度（中值与约 10 秒平滑，并排除比中位数高 25° 以上的异常传感器）调速，不是 CPU 平均温度；默认目标 80°。正常每秒最多升 30 RPM、降 12 RPM。目标不是温度上限；持续负载可能需要高转速或全速。原始温度达到 105°、或平滑温度高于目标 15° 时不再交给系统自动，而是直接把风扇拉到满速（系统自动在高温下反而会降速，这里实测掉到 1,300 RPM 左右）。温度回到不高于 min(95°, 目标+8°)、平滑不高于目标+10°并保持 30 秒后，才从满速慢慢回到智能温控。温度读不到时保持当前转速并显示「温度读取中断」，不会交还系统自动；单个异常传感器也不会让风扇来回跳。只有关闭、退出或调速命令失败时才恢复系统自动；退出失败会保留应用。需要已授权的风扇服务。",
+                                     "Uses the hottest CPU core (median plus about 10 seconds of smoothing, ignoring probes more than 25° above the median), not the CPU average; default target 80°. Normal ramps: up to +30 / −12 RPM per second. The target is not a temperature limit; sustained load may need full speed. At raw 105° or a smoothed target +15° the fan is driven to full speed by VibeDeck instead of being handed to system Auto, which backs off at high temperature (it sat near 1,300 RPM here). Full speed is released only after raw falls to at or below the lower of 95° and target +8°, smoothed at or below target +10°, held for 30 seconds. Without a temperature the current speed is held and shown as “temperature lost”; Auto is never asked to cool a hot machine. Disabling, quitting, or a failed fan command restores system Auto; failed quit leaves the app running. Requires the authorized fan service."))
                 Spacer(minLength: 4)
-                Toggle("", isOn: Binding(get: { thermostat.enabled }, set: { thermostat.setEnabled($0) }))
+                Toggle("", isOn: Binding(get: { thermostat.enabled }, set: { on in
+                    touched = false
+                    thermostat.setEnabled(on)
+                }))
                     .labelsHidden().toggleStyle(.switch).controlSize(.mini)
-                    .disabled(demo || installation != .installed)
+                    // A needed service update still lets the user switch Smart cooling off.
+                    .disabled(demo || (installation != .installed && !thermostat.enabled))
                     .accessibilityIdentifier("fan.thermostat")
             }
             if thermostat.enabled {
@@ -405,12 +411,22 @@ struct FanControlCard: View {
                     Text(thermostat.phase.label).font(VG.caption).foregroundStyle(.secondary)
                 }
                 HStack(spacing: 6) {
-                    Text(L("最高 ", "Max ") + SystemFormat.temperature(thermostat.rawTemperature)
+                    // Before the first thermostat frame, show what the monitor is already reading instead of two dashes.
+                    Text(L("最高 ", "Max ") + SystemFormat.temperature(thermostat.rawTemperature ?? monitor.latest.cpuTempMax)
                          + L(" · 平滑 ", " · Smoothed ") + SystemFormat.temperature(thermostat.lastTemperature))
                     Spacer(minLength: 4)
                     Text(thermostat.commandedRPM.map { L("指令 \($0) RPM", "Sent \($0) RPM") } ?? L("指令 —", "Sent —"))
                 }
                 .font(VG.caption).monospacedDigit().foregroundStyle(.secondary)
+                if thermostat.rawTemperature == nil, thermostat.lastError == nil {
+                    Text(thermostat.phase == .sensorLost
+                         ? L("温度读数中断：风扇保持当前转速，温度回来就继续调速",
+                             "Temperature lost: holding the current speed until the sensor returns")
+                         : L("正在接管风扇：读取温度和风扇范围大约需要几秒…",
+                             "Taking over: reading the temperature and fan range takes a few seconds…"))
+                        .font(.system(size: 10 * VG.scale)).foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             if let error = thermostat.lastError {
                 Text(error).font(VG.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
@@ -454,7 +470,8 @@ struct FanControlCard: View {
             case .success(let readings):
                 fans = readings
                 readError = nil
-                if !touched, let first = readings.first {
+                // Smart cooling owns the target register; a previous manual touch must not freeze the display.
+                if !touched || thermostat.enabled, let first = readings.first {
                     target = Double(first.targetRPM > 0 ? first.targetRPM : first.currentRPM)
                 }
             case .failure(let error):

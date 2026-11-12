@@ -6,6 +6,7 @@ final class AccountMonitor {
     private let lock = NSLock()
     private var store: AccountCycleStore?
     private var cached: [AccountQuotaObservation] = []
+    private var evidence: [AccountQuotaObservation] = []
     private var error: String?
 
     func record(report: ScanReport) {
@@ -16,6 +17,7 @@ final class AccountMonitor {
         store?.record(AccountUsage.quotaObservations(report: report, mergingAccounts: false))
         lock.lock()
         cached = store?.observations ?? []
+        evidence = Array((store?.perSourceObservations ?? []).suffix(4000))
         error = store?.persistenceError
         lock.unlock()
     }
@@ -23,6 +25,11 @@ final class AccountMonitor {
     func snapshot() -> [AccountQuotaObservation] {
         lock.lock(); defer { lock.unlock() }
         return cached
+    }
+    /// Unmerged per-device observations: the estimator uses every device's own baseline as one sample.
+    func quotaEvidence() -> [AccountQuotaObservation] {
+        lock.lock(); defer { lock.unlock() }
+        return evidence
     }
     func persistenceError() -> String? {
         lock.lock(); defer { lock.unlock() }

@@ -3,6 +3,7 @@ import SwiftUI
 /// System page instruments: one hue per subsystem, a live chart in every tile, readings sampled at the monitor’s current cadence.
 struct SystemVitalsView: View {
     @ObservedObject var monitor = SystemMonitor.shared
+    @ObservedObject var externalDisks = ExternalDiskMonitor.shared
     let report: ScanReport
 
     var body: some View {
@@ -16,6 +17,7 @@ struct SystemVitalsView: View {
             .fixedSize(horizontal: false, vertical: true)
             sensors(s)
             diskTile(s, h)
+            externalDiskTile
         }
     }
 
@@ -190,6 +192,94 @@ struct SystemVitalsView: View {
             }
         }
         .glassTile(tint: low ? .orange : Glass.disk)
+    }
+
+    // MARK: External SSDs / HDDs
+
+    /// Volumes outside the boot disk: capacity, bus, SSD/HDD and SMART. A USB bridge often cannot report
+    /// SMART; that is shown honestly rather than as a failure.
+    @ViewBuilder private var externalDiskTile: some View {
+        let list = externalDisks.disks
+        if !list.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Image(systemName: "externaldrive.fill").foregroundStyle(Glass.disk)
+                    Text(L("外接存储", "External storage")).font(VG.headline)
+                    Spacer(minLength: 4)
+                    if externalDisks.refreshedAt > 0 {
+                        Text(L("更新于 ", "Updated ") + UIFormat.agoShort(max(0, Int(Date().timeIntervalSince1970 - externalDisks.refreshedAt))))
+                            .font(VG.caption).foregroundStyle(.tertiary)
+                    }
+                }
+                ForEach(list) { disk in
+                    externalDiskRow(disk)
+                    if disk.id != list.last?.id { Divider().opacity(0.35) }
+                }
+                if !externalDisks.error.isEmpty {
+                    Text(externalDisks.error).font(.system(size: 9 * VG.scale)).foregroundStyle(.orange)
+                        .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .glassTile(tint: Glass.disk)
+            .accessibilityIdentifier("system.externalDisks")
+        }
+    }
+
+    private func externalDiskRow(_ disk: ExternalDisk) -> some View {
+        let low = disk.freeFraction < 0.08
+        let tint: Color = disk.smartFailed ? .red : low ? .orange : Glass.disk
+        let smart: (String, Color) = disk.smartFailed ? (L("SMART 异常", "SMART failing"), .red)
+            : disk.smartHealthy ? (L("SMART 正常", "SMART verified"), .green)
+            : disk.smartUnsupported ? (L("SMART 不支持", "SMART unsupported"), .secondary)
+            : (L("SMART 未知", "SMART unknown"), .secondary)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: disk.isSolidState == true ? "externaldrive.fill" : "externaldrive")
+                    .font(.system(size: 12 * VG.scale)).foregroundStyle(tint)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: 4) {
+                        Text(disk.volumeName).font(VG.font(12, .semibold)).lineLimit(1)
+                        if disk.isSolidState != nil {
+                            Text(disk.mediaLabel).font(VG.font(9)).foregroundStyle(.secondary)
+                                .padding(.horizontal, 4).padding(.vertical, 0.5)
+                                .background(Capsule().fill(Color.primary.opacity(0.06)))
+                        }
+                    }
+                    Text(disk.model + (disk.protocolName.isEmpty ? "" : " · " + disk.protocolName))
+                        .font(VG.font(9)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                }
+                Spacer(minLength: 4)
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text(String(format: L("剩 %.0f GB / %.0f GB", "%.0f GB free / %.0f GB"),
+                                Double(disk.freeBytes) / 1_000_000_000, Double(disk.totalBytes) / 1_000_000_000))
+                        .font(VG.font(10, .semibold)).monospacedDigit().foregroundStyle(low ? .orange : .primary)
+                        .lineLimit(1)
+                    Text(smart.0).font(VG.font(8.5, .medium)).foregroundStyle(smart.1).lineLimit(1)
+                }
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.07))
+                    Capsule().fill(tint.opacity(0.8))
+                        .frame(width: max(2, geo.size.width * CGFloat(disk.usedFraction)))
+                }
+            }.frame(height: 4)
+            HStack(spacing: 8) {
+                Text(disk.mountPath).font(VG.font(8.5)).foregroundStyle(.tertiary).lineLimit(1)
+                Spacer(minLength: 2)
+                Text(String(format: "%.0f%%", disk.usedFraction * 100)).font(VG.font(8.5)).foregroundStyle(.tertiary).monospacedDigit()
+                if disk.removable {
+                    Image(systemName: "eject").font(.system(size: 8)).foregroundStyle(.tertiary)
+                        .help(L("可移除介质", "Removable media"))
+                }
+            }
+        }
+        .padding(.vertical, 3)
+        .help(L("型号 ", "Model ") + disk.model + " · " + disk.smartStatus
+              + (disk.bsdName.isEmpty ? "" : " · " + disk.bsdName)
+              + "\n" + (disk.smartUnsupported ? L("这个 USB/桥接芯片不上报 SMART，无法判断寿命。", "This USB bridge does not expose SMART, so drive health cannot be judged.") : ""))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(disk.volumeName) \(disk.mediaLabel) \(smart.0)")
     }
 
     private func legend(_ tint: Color, _ title: String, _ value: String) -> some View {

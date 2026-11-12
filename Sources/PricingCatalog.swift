@@ -221,10 +221,26 @@ public enum PricingCatalog {
 public struct CostEngine {
     public var user: ProcessScanner.PriceTable
     public var catalog: PricingCatalog.Catalog
+    /// Reference CNY-per-USD rate for API-equivalent accounting. Original recorded costs keep their currency.
+    public var usdPerCNY: Double?
 
-    public init(user: ProcessScanner.PriceTable = ProcessScanner.PriceTable(), catalog: PricingCatalog.Catalog = PricingCatalog.builtin) {
+    public init(user: ProcessScanner.PriceTable = ProcessScanner.PriceTable(), catalog: PricingCatalog.Catalog = PricingCatalog.builtin,
+                usdPerCNY: Double? = nil) {
         self.user = user
         self.catalog = catalog
+        self.usdPerCNY = usdPerCNY
+    }
+
+    /// API-equivalent money is reported in USD whenever the reference rate is usable. A missing rate leaves
+    /// the original currency in place rather than inventing a conversion.
+    public func usdValue(_ cost: (value: Double, currency: String)) -> (value: Double, currency: String) {
+        guard cost.currency.uppercased() == "CNY", let rate = usdPerCNY, rate.isFinite, rate > 0 else { return cost }
+        let converted = cost.value / rate
+        return converted.isFinite ? (converted, "USD") : cost
+    }
+
+    public func usdValueOrNil(_ cost: (value: Double, currency: String)?) -> (value: Double, currency: String)? {
+        cost.map { usdValue($0) }
     }
 
     public enum Origin { case user, builtin }
@@ -254,19 +270,22 @@ public struct CostEngine {
 
 public extension CostEngine {
     /// API-equivalent value is independent of subscription billing (whose existing cost remains zero).
-    /// Unknown models remain unknown; no family substitution or implicit currency conversion.
+    /// Unknown models remain unknown; no family substitution. A CNY rate, when present, normalises
+    /// domestic rows to USD so every API-equivalent total is comparable.
     func equivalentCost(model: String, ctx: Int64, cacheRead: Int64, cacheWrite: Int64,
                         cacheWrite1h: Int64 = 0, out: Int64, tier: String? = nil,
                         at: Date? = nil) -> (value: Double, currency: String)? {
         let apiModel = Self.isSubscriptionIncluded(model) ? String(model.dropFirst("chatgpt-web/".count)) : model
+        // Domestic user rows are usually priced in CNY; the API-equivalent view normalises them so the
+        // dashboard has one comparable figure. The original recorded cost still uses the row's currency.
         if let value = user.cost(model: model, ctx: ctx, cacheRead: cacheRead, cacheWrite: cacheWrite, out: out, at: at, tier: tier) {
-            return (value, user.currency(for: model))
+            return usdValue((value, user.currency(for: model)))
         }
         if apiModel != model, let value = user.cost(model: apiModel, ctx: ctx, cacheRead: cacheRead, cacheWrite: cacheWrite, out: out, at: at, tier: tier) {
-            return (value, user.currency(for: apiModel))
+            return usdValue((value, user.currency(for: apiModel)))
         }
         guard let entry = PricingCatalog.entry(for: apiModel, in: catalog) else { return nil }
-        return (PricingCatalog.cost(entry, ctx: ctx, cacheRead: cacheRead, cacheWrite: cacheWrite,
-                                    cacheWrite1h: cacheWrite1h, out: out, tier: tier), "USD")
+        return usdValue((PricingCatalog.cost(entry, ctx: ctx, cacheRead: cacheRead, cacheWrite: cacheWrite,
+                                             cacheWrite1h: cacheWrite1h, out: out, tier: tier), "USD"))
     }
 }

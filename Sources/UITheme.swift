@@ -101,6 +101,7 @@ enum UIFormat {
     private static let cacheLock = NSLock()
     private static var relativeCache: [String: RelativeDateTimeFormatter] = [:]
     private static var durationCache: [String: DateComponentsFormatter] = [:]
+    private static var clockCache: [String: DateFormatter] = [:]
 
     private static func relative(_ seconds: TimeInterval, style: RelativeDateTimeFormatter.UnitsStyle) -> String {
         let key = locale.identifier + ":\(style.rawValue)"
@@ -121,6 +122,20 @@ enum UIFormat {
 
     static func agoShort(_ seconds: Int) -> String {
         relative(-Double(max(0, seconds)), style: .abbreviated)
+    }
+
+    /// Wall-clock time for "when was this read" tooltips.
+    static func clock(_ timestamp: TimeInterval) -> String {
+        let key = locale.identifier + ":clock"
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        let formatter = clockCache[key] ?? {
+            let made = DateFormatter()
+            made.locale = locale
+            made.dateFormat = "M/d HH:mm:ss"
+            clockCache[key] = made
+            return made
+        }()
+        return formatter.string(from: Date(timeIntervalSince1970: timestamp))
     }
 
     static func countdown(to timestamp: TimeInterval?, now: TimeInterval = Date().timeIntervalSince1970) -> String? {

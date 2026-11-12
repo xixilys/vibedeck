@@ -65,6 +65,8 @@ final class FanThermostat: ObservableObject {
     static let shared = FanThermostat()
     static let enabledKey = "vg.fan.thermostat"
     static let targetKey = "vg.fan.thermostatTarget"
+    /// Raw hottest-core emergency. Above this the fan goes to full speed under our own control.
+    static let emergencyTemperature = 105.0
 
     struct Dependencies {
         typealias ReadingReply = (Result<[FanReading], FanControlError>) -> Void
@@ -90,7 +92,8 @@ final class FanThermostat: ObservableObject {
     @Published private(set) var phase: Phase = .waiting
 
     enum Phase {
-        case waiting, reading, rampingUp, holding, rampingDown, restoring, retrying, systemAutomatic
+        case waiting, reading, rampingUp, holding, rampingDown, emergency, sensorLost
+        case restoring, retrying, systemAutomatic
         var label: String {
             switch self {
             case .waiting: return L("等待温度", "Waiting for temperature")
@@ -98,6 +101,8 @@ final class FanThermostat: ObservableObject {
             case .rampingUp: return L("升速", "Ramping up")
             case .holding: return L("保持", "Holding")
             case .rampingDown: return L("降速", "Ramping down")
+            case .emergency: return L("紧急散热 · 满速", "Emergency · full speed")
+            case .sensorLost: return L("温度读取中断", "Temperature lost")
             case .restoring: return L("恢复系统自动", "Restoring Auto")
             case .retrying: return L("等待重试", "Retry pending")
             case .systemAutomatic: return L("系统自动", "System auto")
@@ -127,6 +132,7 @@ final class FanThermostat: ObservableObject {
     private var recoverySince: TimeInterval?
     private var quitting = false
     private var quitReplies: [Dependencies.CommandReply] = []
+    private var activity: NSObjectProtocol?
 
     private convenience init() {
         let defaults = UserDefaults.standard
@@ -155,10 +161,23 @@ final class FanThermostat: ObservableObject {
         self.target = target
         self.dependencies = dependencies
         lastReceipt = dependencies.uptime()
-        if enabled { armWatchdog() }
+        if enabled { armWatchdog(); preventAppNap() }
     }
 
-    deinit { watchdog?(); retry?() }
+    deinit { watchdog?(); retry?(); allowAppNap() }
+
+    /// A hidden menu-bar app can be App-Napped, and throttled timers would leave the fan at a stale target with
+    /// no feedback. The activity prevents App Nap only; it never keeps the system from idle sleep.
+    private func preventAppNap() {
+        guard activity == nil else { return }
+        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep],
+                                                         reason: "Smart cooling keeps sampling the CPU temperature")
+    }
+
+    private func allowAppNap() {
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        activity = nil
+    }
 
     func setEnabled(_ on: Bool) {
         guard on != enabled || quitting else { return }
@@ -167,7 +186,7 @@ final class FanThermostat: ObservableObject {
         dependencies.saveEnabled(on)
         resetMode()
         dependencies.active(on)
-        if on { armWatchdog() } else { requestAutomatic(reason: nil) }
+        if on { armWatchdog(); preventAppNap() } else { allowAppNap(); requestAutomatic(reason: nil) }
     }
 
     func setTarget(_ celsius: Double) {
@@ -184,6 +203,7 @@ final class FanThermostat: ObservableObject {
         dependencies.saveEnabled(false)
         resetMode()
         dependencies.active(false)
+        allowAppNap()
     }
 
     private func invalidateAsync() {
@@ -243,10 +263,14 @@ final class FanThermostat: ObservableObject {
                 if self.needsAutomatic { self.automaticFailed(error) }
                 else { self.requestAutomatic(reason: error.localizedDescription) }
             } else if self.enabled, !self.quitting, now - self.lastReceipt >= 30 {
+                // No temperature is not a reason to hand the fan back: macOS's own curve is what let a hot machine
+                // sit at its idle speed here. Hold the last command and keep a 30-second heartbeat instead.
                 self.lastTemperature = nil
                 self.rawTemperature = nil
                 self.recoverySince = nil
-                self.requestAutomatic(reason: L("CPU 温度已中断 30 秒", "No CPU temperature for 30 seconds"))
+                if !self.emergencyLatched { self.phase = .sensorLost }
+                self.lastReceipt = now
+                self.armWatchdog()
             } else { self.armWatchdog() }
         }
     }
@@ -261,7 +285,9 @@ final class FanThermostat: ObservableObject {
             lastTemperature = nil
             rawTemperature = nil
             recoverySince = nil
-            requestAutomatic(reason: L("CPU 温度不可用或已过期", "CPU temperature is unavailable or stale"))
+            if !emergencyLatched { phase = .sensorLost }
+            lastReceipt = uptime
+            armWatchdog()
             return
         }
         let receiptGap = uptime - lastReceipt
@@ -272,11 +298,33 @@ final class FanThermostat: ObservableObject {
         lastTemperature = controller.temperature
         armWatchdog()
 
-        // Raw emergency bypasses smoothing. Native Auto, not an unmeasured RPM ramp, owns cooling.
-        if raw >= 105 || (lastTemperature ?? raw) >= target + 15 {
+        // Emergency: take the fan to full speed ourselves. Handing a 105 °C machine to the system curve dropped the
+        // fan to ~1350 RPM here while the hottest core stayed above 110 °C, which controls nothing.
+        if !needsAutomatic, raw >= Self.emergencyTemperature || (lastTemperature ?? raw) >= target + 15 {
             emergencyLatched = true
             recoverySince = nil
-            requestAutomatic(reason: L("CPU 温度较高，交给系统自动", "High CPU temperature; handing cooling to macOS"))
+            phase = .emergency
+            if let range {
+                if !inFlight, commandedRPM != Int(range.high) { send(Int(range.high)) }
+            } else if !inFlight { loadRange() }
+            return
+        }
+        if emergencyLatched {
+            // Full speed is only released after the whole machine has actually cooled: raw under 95 °C (or target+8)
+            // and the smoothed value under target+10 for 30 seconds. Until then the noise is the point.
+            let ceiling = min(95, target + 8)
+            let safe = raw <= ceiling && (lastTemperature ?? raw) <= target + 10
+            if !safe { recoverySince = nil; phase = .emergency; return }
+            if recoverySince == nil { recoverySince = uptime }
+            guard let since = recoverySince, uptime - since >= 30 else { phase = .emergency; return }
+            emergencyLatched = false
+            recoverySince = nil
+            // Resume from the speed we were actually commanding so the ramp down is continuous.
+            if let range {
+                controller.connect(current: Double(commandedRPM ?? Int(range.high)), low: range.low,
+                                   high: range.high, target: target)
+            }
+            phase = .holding
             return
         }
         if needsAutomatic { sendAutomaticIfReady(); return }

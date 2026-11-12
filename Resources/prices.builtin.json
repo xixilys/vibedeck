@@ -1,7 +1,7 @@
 {
  "_source": "OpenAI GPT-6/6.1, GPT-5.6 Sol and verified Claude models: official docs; other entries: existing LiteLLM + ccusage references",
  "_verified_openai_asof": "2026-10-01",
- "_verified_openai_sources": {"gpt-6.1-sol":"https://developers.openai.com/api/docs/models/gpt-6.1-sol","gpt-6-sol":"https://developers.openai.com/api/docs/models/gpt-6-sol","gpt-6-luna":"https://developers.openai.com/api/docs/models/gpt-6-luna","gpt-6-astra":"https://developers.openai.com/api/docs/models/gpt-6-astra","gpt-5.6-sol":"https://developers.openai.com/api/docs/models/gpt-5.6-sol"},
+ "_verified_openai_sources": {"gpt-6.1-terra":"https://developers.openai.com/api/docs/models/gpt-6.1-terra","gpt-6.1-sol":"https://developers.openai.com/api/docs/models/gpt-6.1-sol","gpt-6-sol":"https://developers.openai.com/api/docs/models/gpt-6-sol","gpt-6-luna":"https://developers.openai.com/api/docs/models/gpt-6-luna","gpt-6-astra":"https://developers.openai.com/api/docs/models/gpt-6-astra","gpt-5.6-sol":"https://developers.openai.com/api/docs/models/gpt-5.6-sol"},
  "_verified_anthropic_asof": "2026-10-01",
  "_verified_anthropic_sources": {"claude-fable-5":"https://platform.claude.com/docs/en/about-claude/pricing","claude-opus-4-8":"https://platform.claude.com/docs/en/about-claude/pricing","claude-opus-5":"https://platform.claude.com/docs/en/about-claude/pricing","claude-opus-5-5":"https://platform.claude.com/docs/en/about-claude/pricing","claude-sonnet-4-6":"https://platform.claude.com/docs/en/about-claude/pricing","claude-sonnet-5":"https://platform.claude.com/docs/en/about-claude/pricing","claude-sonnet-5-5":"https://platform.claude.com/docs/en/about-claude/pricing","claude-opus-4-6":"https://platform.claude.com/docs/en/about-claude/pricing","claude-opus-4-7":"https://platform.claude.com/docs/en/about-claude/pricing"},
  "_asof": "2026-09-28",
@@ -62,6 +62,7 @@
  "gpt-6-luna": {"in":0.1,"out":0.5,"cr":0.01,"cw":0.125,"lc":{"threshold":272000,"in":0.2,"out":0.75,"cr":0.02,"cw":0.25},"pri":{"in":0.2,"out":1.0,"cr":0.02}},
  "gpt-6-sol": {"in":2.0,"out":10.0,"cr":0.2,"cw":2.5,"lc":{"threshold":272000,"in":4.0,"out":15.0,"cr":0.4,"cw":5.0},"pri":{"in":4.0,"out":20.0,"cr":0.4}},
  "gpt-6.1-sol": {"in":2.0,"out":10.0,"cr":0.1,"cw":2.5,"lc":{"threshold":272000,"in":4.0,"out":15.0,"cr":0.2,"cw":5.0},"pri":{"in":4.0,"out":20.0,"cr":0.2,"cw":5.0},"fast":2.0},
+ "gpt-6.1-terra": {"in":1.0,"out":5.0,"cr":0.05,"cw":1.25,"lc":{"threshold":272000,"in":2.0,"out":7.5,"cr":0.1,"cw":2.5},"pri":{"in":2.0,"out":10.0,"cr":0.1,"cw":2.5},"fast":2.0},
  "o3": {"in":2.0,"out":8.0,"cr":0.5,"pri":{"in":3.5,"out":14.0,"cr":0.875}},
  "o3-mini": {"in":1.1,"out":4.4,"cr":0.55},
  "o3-pro": {"in":20.0,"out":80.0},

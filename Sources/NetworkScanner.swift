@@ -227,6 +227,7 @@ public final class NetworkScanner {
     public func setPanelVisible(_ visible: Bool) {
         lock.lock()
         panelVisible = visible
+        if visible { lastProxyAt = 0; lastLocalAt = 0 }
         let source = rateTimer
         previousCounters = nil
         snapshotCache.local.downloadBPS = nil
@@ -261,8 +262,10 @@ public final class NetworkScanner {
         let now = Date().timeIntervalSince1970
         lock.lock()
         let doTrace = now - lastTraceAt >= 60
-        let doProxy = now - lastProxyAt >= 10
-        let doLocal = now - lastLocalAt >= 30
+        // Proxy/local details only feed the Network tab; polling subprocesses and the clash API every
+        // 10–30 s while the panel is closed is what kept the app above 5% CPU at rest.
+        let doProxy = now - lastProxyAt >= (panelVisible ? 10 : 60)
+        let doLocal = now - lastLocalAt >= (panelVisible ? 30 : 300)
         let doLeak = now - lastLeakAt >= 600
         let busy = refreshInFlight
         lock.unlock()
@@ -282,8 +285,9 @@ public final class NetworkScanner {
 
         let now = Date().timeIntervalSince1970
         lock.lock()
-        let doProxy = forceAll || now - lastProxyAt >= 10
-        let doLocal = forceAll || now - lastLocalAt >= 30
+        let visible = panelVisible
+        let doProxy = forceAll || now - lastProxyAt >= (visible ? 10 : 60)
+        let doLocal = forceAll || now - lastLocalAt >= (visible ? 30 : 300)
         let doLeak = forceAll || now - lastLeakAt >= 600
         lock.unlock()
 
@@ -584,14 +588,28 @@ public final class NetworkScanner {
 
     private func request(_ url: URL, timeout: TimeInterval, headers: [String: String]) throws -> String { String(data: try requestData(url, timeout: timeout, headers: headers), encoding: .utf8) ?? "" }
 
+    /// One session per transport path, not one per request: creating a URLSession costs CFNetwork
+    /// setup every 2–10 seconds, and the traffic never reuses connections otherwise.
+    private static let directSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpShouldSetCookies = false; config.httpCookieStorage = nil; config.urlCache = nil
+        config.timeoutIntervalForRequest = 8; config.timeoutIntervalForResource = 8
+        // 本机控制端口不经过系统 HTTP 代理，避免把 clashSecret 发到代理服务器。
+        config.connectionProxyDictionary = [:]
+        return URLSession(configuration: config, delegate: NoRedirectDelegate(), delegateQueue: nil)
+    }()
+    private static let proxiedSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpShouldSetCookies = false; config.httpCookieStorage = nil; config.urlCache = nil
+        config.timeoutIntervalForRequest = 8; config.timeoutIntervalForResource = 8
+        return URLSession(configuration: config, delegate: NoRedirectDelegate(), delegateQueue: nil)
+    }()
+
     private func requestData(_ url: URL, timeout: TimeInterval, headers: [String: String]) throws -> Data {
         var req = URLRequest(url: url); req.timeoutInterval = timeout; req.httpMethod = "GET"
         for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-        let config = URLSessionConfiguration.ephemeral; config.httpShouldSetCookies = false; config.httpCookieStorage = nil; config.urlCache = nil; config.timeoutIntervalForRequest = timeout; config.timeoutIntervalForResource = timeout
-        // 本机控制端口不经过系统 HTTP 代理，避免把 clashSecret 发到代理服务器。
-        if Self.validatedClashURL(url.deletingLastPathComponent().absoluteString) != nil { config.connectionProxyDictionary = [:] }
-        let session = URLSession(configuration: config, delegate: NoRedirectDelegate(), delegateQueue: nil)
-        defer { session.finishTasksAndInvalidate() }
+        let session = Self.validatedClashURL(url.deletingLastPathComponent().absoluteString) != nil
+            ? Self.directSession : Self.proxiedSession
         let resultBox = RequestResult()
         let sem = DispatchSemaphore(value: 0)
         session.dataTask(with: req) { data, response, error in

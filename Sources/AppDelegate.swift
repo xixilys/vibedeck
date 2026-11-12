@@ -106,6 +106,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         DashboardView.migrateTabSelection()
         NetworkScanner.shared.start()
         SystemMonitor.shared.start()
+        ExternalDiskMonitor.shared.start()
+        VM2APIQuotaStore.shared.start()
         if FanThermostat.shared.enabled { SystemMonitor.shared.setThermostatActive(true) }
         authorizeFanServiceAtLaunch()
         DispatchQueue.global(qos: .utility).async { _ = PricingCatalog.builtin }
@@ -233,6 +235,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         pet?.setPaused(true)
         NetworkScanner.shared.setPanelVisible(true)
         SystemMonitor.shared.setVisible(true)
+        ExternalDiskMonitor.shared.setPanelVisible(true)
         let started = CACurrentMediaTime()
         let reused = canReusePanel()
         if !reused { buildPanel() }
@@ -303,6 +306,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         pet?.setPaused(false)
         NetworkScanner.shared.setPanelVisible(false)
         SystemMonitor.shared.setVisible(false)
+        ExternalDiskMonitor.shared.setPanelVisible(false)
         // The generation stays: a kept panel still reports its height through the same actions.
         pendingPanelHeight = nil
         isRelayoutScheduled = false
@@ -607,6 +611,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         var actions = PanelActions()
         actions.accountLedgerError = { AccountMonitor.shared.persistenceError() }
         actions.accountQuotas = { AccountMonitor.shared.snapshot() }
+        actions.quotaEvidence = { AccountMonitor.shared.quotaEvidence() }
         actions.latestReport = { [weak self] in self?.currentReport }
         actions.isVisible = { [weak self] in self?.isPanelOpen == true }
         actions.cleanOrphans = { [weak self] in

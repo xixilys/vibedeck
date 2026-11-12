@@ -129,10 +129,13 @@ extension Notification.Name {
 
 struct SwipeScroll<Content: View>: NSViewRepresentable {
     let content: Content
+    /// Changes when the page changes; the scroll view keeps its identity and moves back to the top.
+    let resetToken: String
     let onSwipe: (Int) -> Void
     let onHeight: (CGFloat) -> Void
 
     final class Coordinator {
+        var lastResetToken = ""
         private var pendingUpdate: (() -> Void)?
         private var updateScheduled = false
         private var generation: UInt = 0
@@ -166,6 +169,7 @@ struct SwipeScroll<Content: View>: NSViewRepresentable {
         sv.autohidesScrollers = true
         sv.drawsBackground = false
         sv.onSwipe = onSwipe
+        context.coordinator.lastResetToken = resetToken
         let host = NSHostingView(rootView: MeasuredScrollContent(content: content, onHeight: onHeight))
         // The document width is fixed below; only its natural height is needed.
         host.sizingOptions = [.intrinsicContentSize]
@@ -181,10 +185,23 @@ struct SwipeScroll<Content: View>: NSViewRepresentable {
 
     func updateNSView(_ sv: SwipeScrollView, context: Context) {
         sv.onSwipe = onSwipe
+        let reset = context.coordinator.lastResetToken != resetToken
+        context.coordinator.lastResetToken = resetToken
+        if reset {
+            // The old page may have been scrolled; a new page always starts at its top.
+            sv.contentView.scroll(to: .zero)
+            sv.reflectScrolledClipView(sv.contentView)
+        }
         if let host = sv.documentView as? NSHostingView<MeasuredScrollContent<Content>> {
             let latest = MeasuredScrollContent(content: content, onHeight: onHeight)
             // Updating another hosting tree synchronously inside a SwiftUI update can reenter layout.
-            context.coordinator.schedule { [weak host] in host?.rootView = latest }
+            context.coordinator.schedule { [weak host, weak sv] in
+                host?.rootView = latest
+                if reset, let sv {
+                    sv.contentView.scroll(to: .zero)
+                    sv.reflectScrolledClipView(sv.contentView)
+                }
+            }
         }
     }
 
@@ -199,6 +216,8 @@ public struct PanelActions {
     /// 主线程读取常驻采集器已经生成的报告；面板不重复扫描日志和进程。
     public var latestReport: () -> ScanReport? = { nil }
     public var accountQuotas: () -> [AccountQuotaObservation] = { [] }
+    /// Unmerged per-device observations of the same quota cycle; each device's baseline is one estimate sample.
+    public var quotaEvidence: () -> [AccountQuotaObservation] = { [] }
     public var accountLedgerError: () -> String? = { nil }
     public var isVisible: () -> Bool = { true }
     public var cleanOrphans: () -> Void = {}
@@ -333,6 +352,11 @@ public struct DashboardView: View {
     @AppStorage("vg.tab") private var tab: Int = 0
     @AppStorage("vg.showAPITab") private var showAPITab = true
     @AppStorage("vg.device") private var deviceKey: String = "all"
+    /// Comma-separated subscription ids shown in the overview. Empty = every subscription (the default);
+    /// `__none__` = the user explicitly hid them all, so the grid stays empty instead of springing back.
+    @AppStorage("vg.monitoredSubs") private var monitoredSubsRaw: String = ""
+    /// One-time bridge from the old single "Claude · vm2api" switch to per-account vm2api choices.
+    @AppStorage("vg.vm2apiSelectionSeeded") private var vmSelectionSeeded = false
     @AppStorage("vg.todayCLI") private var todayCLIKey: String = ""
     @AppStorage("vg.language") private var languageKey: String = "system"
     @AppStorage("remoteHosts") private var remoteHostsRaw: String = ""
@@ -340,7 +364,15 @@ public struct DashboardView: View {
     @State private var hostError = ""
     @AppStorage(DisplayCurrency.defaultsKey) private var currencyKey = "usd"
     @ObservedObject private var exchangeRates = ExchangeRates.shared
+    @ObservedObject private var vm2apiQuota = VM2APIQuotaStore.shared
+    @State private var monitorShown = false
     @State private var accountQuotas: [AccountQuotaObservation] = []
+    /// Per-device observations of the same quota cycle: several independent baseline samples for the estimate.
+    @State private var quotaEvidence: [AccountQuotaObservation] = []
+    /// Money view per quota window, keyed by `AccountUsage.valueKey`.
+    @State private var quotaValues: [String: QuotaWindowValue] = [:]
+    @State private var quotaValuesFingerprint = ""
+    @State private var quotaRebuildInFlight = false
     @State private var accountLedgerError: String?
     @State private var expandedCards: Set<String> = []
     @State private var measuredHeight: CGFloat = 400
@@ -352,6 +384,8 @@ public struct DashboardView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var drillDown: String? = nil      // 非空 = 正在看某个平台的详情页
+    /// The account card the current detail page was opened from, so a click does not merge every quota twice.
+    @State private var detailAccountCard: AccountPresentation?
     @State private var autoCleanOn: Bool
     @State private var launchAtLoginOn: Bool
     @State private var notifyOn: Bool
@@ -377,9 +411,18 @@ public struct DashboardView: View {
         _report = State(initialValue: report)
         self.actions = actions
         if preload {
-            _accountQuotas = State(initialValue: actions.accountQuotas())
+            let quotas = actions.accountQuotas()
+            let evidence = actions.quotaEvidence()
+            let snapshot = UsageHistory.shared.snapshot()
+            let now = Date().timeIntervalSince1970
+            _accountQuotas = State(initialValue: quotas)
+            _quotaEvidence = State(initialValue: evidence)
             _accountLedgerError = State(initialValue: actions.accountLedgerError())
-            _history = State(initialValue: UsageHistory.shared.snapshot())
+            _history = State(initialValue: snapshot)
+            _quotaValues = State(initialValue: Self.quotaValueMap(
+                points: snapshot.accountUsage.points, evidence: evidence, groups: snapshot.accountUsage.groups,
+                coverage: snapshot.accountUsage.coverageStartByAccount,
+                plans: PlanQuota.collect(local: report.detectedLLMs, remote: report.remoteLLMs, now: now), now: now))
             _network = State(initialValue: NetworkScanner.shared.snapshot())
             _health = State(initialValue: NerfDetector.shared.snapshot())
             _drillDown = State(initialValue: drill)
@@ -417,6 +460,60 @@ public struct DashboardView: View {
         let currentIDs = Set(accountCards.map(\.id))
         return accountCards + historicalAccountCards.filter { !currentIDs.contains($0.id) }
     }
+    /// The card for the open account detail; falls back to a merge only when the cached card is missing.
+    private var openAccountCard: AccountPresentation? {
+        guard let selected = drillDown, selected.hasPrefix("account:") else { return nil }
+        if let detailAccountCard, "account:" + detailAccountCard.id == selected { return detailAccountCard }
+        return allAccountCards.first { "account:" + $0.id == selected }
+    }
+    private var monitoredSubs: Set<String> {
+        Set(monitoredSubsRaw.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+    }
+    private var hidesAllSubs: Bool { monitoredSubs.contains("__none__") }
+    private func isSubMonitored(_ id: String) -> Bool {
+        let selection = monitoredSubs
+        if selection.isEmpty { return true }
+        if selection.contains("__none__") { return false }
+        return selection.contains(id)
+    }
+    /// All subscription ids the monitor menu can toggle. A disappearing account stays in the saved list
+    /// harmlessly; it simply does not match anything until it comes back.
+    private func toggleSub(_ id: String, all: [String]) {
+        var selection = monitoredSubs.subtracting(["__none__"])
+        let universe = Set(all + [id])
+        if monitoredSubs.isEmpty { selection = universe }
+        if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
+        if selection.isEmpty { monitoredSubsRaw = "__none__" }
+        else if selection == universe { monitoredSubsRaw = "" }
+        else { monitoredSubsRaw = selection.sorted().joined(separator: ",") }
+    }
+
+    /// Existing users had one `claude-vm` switch, not per-account ids. Once vm2api accounts arrive,
+    /// keep their normal-account selection and add every vm2api account; new cards must not disappear
+    /// behind a selection that predates them. This runs once, then per-account toggles remain authoritative.
+    private func seedVMSelectionIfNeeded() {
+        guard !vmSelectionSeeded else { return }
+        let accounts = vm2apiQuota.snapshot.accounts
+        guard !accounts.isEmpty else { return }
+        vmSelectionSeeded = true
+        let vmIDs = Set(accounts.map(\.id))
+        var selection = monitoredSubs
+        let hadLegacySwitch = selection.contains("claude-vm")
+        selection.remove("claude-vm")
+        if selection.contains("__none__") {
+            if hadLegacySwitch { monitoredSubsRaw = "__none__" }
+            return
+        }
+        if selection.isEmpty {
+            // Empty means "all". The old sentinel alone is also promoted to all.
+            if hadLegacySwitch { monitoredSubsRaw = "" }
+            return
+        }
+        let merged = selection.isDisjoint(with: vmIDs) ? selection.union(vmIDs) : selection
+        if merged != selection || hadLegacySwitch {
+            monitoredSubsRaw = merged.sorted().joined(separator: ",")
+        }
+    }
     private var unconfirmedLogins: [AccountPresence] {
         AccountPresentation.latestPresence(report.accountPresence).filter {
             if !AccountPresentation.isCurrent($0, now: nowTS) { return true }
@@ -426,6 +523,81 @@ public struct DashboardView: View {
     }
     private func moneyText(_ values: [String: Double]) -> String {
         MoneyDisplay.format(values, mode: displayCurrency, quote: exchangeRates.quote).text
+    }
+    /// Compact display-currency text for quota tiles; conversion behaves exactly like `moneyText`.
+    private func quotaMoneyText(_ values: [String: Double]) -> String {
+        MoneyDisplay.compactFormat(values, mode: displayCurrency, quote: exchangeRates.quote, at: nowTS)
+    }
+
+    /// Money view per quota window, built in one pass over the ledger. Accounts use their own requests;
+    /// subscription plans without a sign-in identity reuse the anonymous requests of their pool. Each window
+    /// adds every accounting plane: local CLIs never route through the CPA relay, so nothing is charged twice.
+    static func quotaValueMap(points: [AccountUsagePoint], evidence: [AccountQuotaObservation],
+                              groups: [AccountUsageGroup], coverage: [String: TimeInterval],
+                              plans: [PlanQuota], now: TimeInterval) -> [String: QuotaWindowValue] {
+        var values: [String: QuotaWindowValue] = [:]
+        var identities: [String: AccountIdentity] = [:]
+        for q in evidence { if let account = q.account { identities[account.key] = account } }
+        for group in groups { if let account = group.account { identities[account.key] = account } }
+        for (key, account) in identities {
+            let accountEvidence = evidence.filter { $0.account == account }
+            guard !accountEvidence.isEmpty else { continue }
+            // CLI logs often carry no account id (every Claude row is anonymous); the quota's own devices are the
+            // only identity we can prove, so their anonymous requests join this account's spend.
+            let sources = Set(accountEvidence.map(\.source))
+            let accountPoints = points.filter { $0.account == account || ($0.account == nil && sources.contains($0.source)) }
+            guard !accountPoints.isEmpty else { continue }
+            let computed = AccountUsage.windowValues(quotas: accountEvidence, points: accountPoints,
+                                                     coverageStart: coverage[key], alreadyDeduplicated: true, now: now)
+            for value in computed.values {
+                values[AccountUsage.valueKey(account: account, pool: value.pool, window: value.window)] = value
+            }
+        }
+        let anonymous = points.filter { $0.account == nil }
+        guard !anonymous.isEmpty else { return values }
+        var byPool: [String: [AccountUsagePoint]] = [:]
+        for point in anonymous { byPool[point.pool, default: []].append(point) }
+        for plan in plans where !plan.observations.isEmpty {
+            let planPoints = Set(plan.observations.map(\.pool)).flatMap { byPool[$0] ?? [] }
+            guard !planPoints.isEmpty else { continue }
+            let computed = AccountUsage.windowValues(quotas: plan.observations, points: planPoints,
+                                                     alreadyDeduplicated: true, now: now)
+            for value in computed.values {
+                values[AccountUsage.valueKey(account: nil, pool: value.pool, window: value.window)] = value
+            }
+        }
+        return values
+    }
+
+    /// Rebuilt only when the ledger or the quota evidence changed, and always off the main thread: the panel
+    /// re-renders every few seconds and scanning 380k requests per rebuild used to stall those frames.
+    private func rebuildQuotaValues() {
+        let now = nowTS
+        let evidence = quotaEvidence.isEmpty ? availableAccountQuotas : quotaEvidence
+        let plans = PlanQuota.collect(local: currentLLMs, remote: report.remoteLLMs, now: now)
+        let planStamp = (currentLLMs.map { "\($0.name):\($0.fiveHour?.capturedAt ?? 0):\($0.sevenDay?.capturedAt ?? 0)" }
+            + report.remoteLLMs.sorted { $0.key < $1.key }.flatMap { host, list in
+                list.map { "\(host)/\($0.name):\($0.fiveHour?.capturedAt ?? 0):\($0.sevenDay?.capturedAt ?? 0)" }
+            }).joined(separator: ",")
+        // Quota readings arrive every scan; the money only needs to follow them about once a minute, and the
+        // ledger scan itself already changes this fingerprint.
+        let fingerprint = [String(history.capturedAt), String(history.accountUsage.points.count),
+                           String(evidence.count), String(Int((evidence.map(\.capturedAt).max() ?? 0) / 60)), planStamp]
+            .joined(separator: "|")
+        guard fingerprint != quotaValuesFingerprint, !quotaRebuildInFlight else { return }
+        quotaValuesFingerprint = fingerprint
+        quotaRebuildInFlight = true
+        let points = history.accountUsage.points
+        let groups = history.accountUsage.groups
+        let coverage = history.accountUsage.coverageStartByAccount
+        DispatchQueue.global(qos: .utility).async {
+            let values = Self.quotaValueMap(points: points, evidence: evidence, groups: groups,
+                                            coverage: coverage, plans: plans, now: now)
+            DispatchQueue.main.async {
+                self.quotaRebuildInFlight = false
+                if values != self.quotaValues { self.quotaValues = values }
+            }
+        }
     }
     private var nowTS: TimeInterval { liveNow.timeIntervalSince1970 }
     private var currentTokens: TokenStats { report.tokens }
@@ -643,6 +815,8 @@ public struct DashboardView: View {
         accountLedgerError = actions.accountLedgerError()
         let latestQuotas = actions.accountQuotas()
         if latestQuotas != accountQuotas { accountQuotas = latestQuotas }
+        let latestEvidence = actions.quotaEvidence()
+        if latestEvidence != quotaEvidence { quotaEvidence = latestEvidence }
         let latestNetwork = NetworkScanner.shared.snapshot()
         if network != latestNetwork { network = latestNetwork }
         let latestHistory = UsageHistory.shared.snapshot()
@@ -653,6 +827,8 @@ public struct DashboardView: View {
         if let latest = actions.latestReport(), latest.capturedAt != report.capturedAt {
             report = latest
         }
+        if drillDown?.hasPrefix("account:") == true { detailAccountCard = openAccountCard }
+        rebuildQuotaValues()
     }
 
     /// A disconnected mount can stall stat(); the view only reads the last result.
@@ -676,10 +852,17 @@ public struct DashboardView: View {
     /// real height. Applying both made the popover drop and spring back. Only apply a height that has held
     /// for a moment; growth to a larger settled value is applied the same way.
     private func settleHeight(_ height: CGFloat) {
-        guard abs(height - measuredHeight) > 1 else { heightGeneration &+= 1; return }
+        guard abs(height - measuredHeight) > 1 else { return }
+        // Shrinking is what opening a detail page does, and waiting 150 ms for it is the "click feels stuck"
+        // part. Apply it at once; growth waits briefly for charts/grids to finish their first layout.
+        if height < measuredHeight {
+            heightGeneration &+= 1
+            measuredHeight = height
+            return
+        }
         heightGeneration &+= 1
         let generation = heightGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             guard generation == heightGeneration, abs(height - measuredHeight) > 1 else { return }
             measuredHeight = height
         }
@@ -733,6 +916,7 @@ public struct DashboardView: View {
 
             SwipeScroll(
                 content: tabContent.frame(width: Self.panelWidth - 24, alignment: .leading),
+                resetToken: "\(tab):\(drillDown ?? "overview")",
                 onSwipe: { step in
                     guard drillDown == nil else { return }   // 详情页里不响应滑动，只用「返回」按钮
                     let visible = showAPITab ? [0, 1, 2, 3, 4] : [0, 2, 3, 4]
@@ -742,9 +926,8 @@ public struct DashboardView: View {
                 },
                 onHeight: { h in settleHeight(h) }
             )
-            // A new page gets a fresh clip view. Otherwise NSScrollView carries the previous page's
-            // scroll origin into Back/Tab navigation and hides the new page's first controls.
-            .id("\(tab):\(drillDown ?? "overview")")
+            // The scroll view is reused; `resetToken` moves it back to the top instead of tearing down
+            // the whole NSScrollView/NShostingView tree on every tab or detail navigation.
             .frame(width: Self.panelWidth - 24, height: min(max(measuredHeight, 120), contentHeightLimit))
             .background(GeometryReader { geometry in
                 Color.clear.preference(key: PanelHeightPreference.self, value: ["viewport": geometry.size.height])
@@ -774,7 +957,9 @@ public struct DashboardView: View {
                 actions.panelHeightChanged(height)
             }
         }
-        .onChange(of: tab) { _, _ in actions.relayout() }
+        // The page's measured height drives the resize. Calling relayout here with the previous page's
+        // pending height made the popover resize twice on every tab click.
+
         .onChange(of: showAPITab) { _, shown in
             if !shown, tab == 1 { tab = 0 }
             actions.relayout()
@@ -783,16 +968,20 @@ public struct DashboardView: View {
         .onChange(of: languageKey) { _, _ in actions.relayout() }
         .onChange(of: drillDown) { _, page in
             if page == nil { detailBackStack.removeAll() }
-            actions.relayout()
         }
         .onReceive(liveTicker) { date in
             guard actions.isVisible() else { return }
             // Countdowns show minutes; re-rendering the whole panel every 5 s is what made it feel heavy.
             if Int(date.timeIntervalSince1970 / 30) != Int(liveNow.timeIntervalSince1970 / 30) { liveNow = date }
+            vm2apiQuota.refreshIfNeeded()
+            seedVMSelectionIfNeeded()
             refreshLive()
         }
+        .onChange(of: vm2apiQuota.snapshot.accounts) { _, _ in seedVMSelectionIfNeeded() }
         .onAppear {
             if !showAPITab, tab == 1 { tab = 0 }
+            vm2apiQuota.refreshIfNeeded()
+            seedVMSelectionIfNeeded()
             refreshLive()
         }
         .onReceive(NotificationCenter.default.publisher(for: .refreshVibeDeckPanel)) { _ in rescanAll() }
@@ -802,6 +991,7 @@ public struct DashboardView: View {
             if drillDown != nil { drillDown = nil }
             let now = Date()
             if Int(now.timeIntervalSince1970 / 30) != Int(liveNow.timeIntervalSince1970 / 30) { liveNow = now }
+            seedVMSelectionIfNeeded()
             refreshLive()
         }
         .onReceive(NotificationCenter.default.publisher(for: .selectVibeDeckTab)) { note in
@@ -853,6 +1043,7 @@ public struct DashboardView: View {
         if name == Self.devicesPage { return L("设备", "Devices") }
         if name == Self.pricesPage { return L("模型价格", "Model prices") }
         if name == Self.settingsPage { return L("设置", "Settings") }
+        if name == Self.vm2apiPage { return L("vm2api 额度", "vm2api quotas") }
         if name == Self.accountsPage { return L("当前登录账号", "Signed-in accounts") }
         if name == Self.accountHistoryPage { return L("历史账号记录", "Account history") }
         if name == Self.livePage { return L("实时与设备", "Live & devices") }
@@ -860,7 +1051,7 @@ public struct DashboardView: View {
         if name == Self.processesPage { return L("Codex 进程", "Codex processes") }
         // Only account pages need the (expensive) card list; platform pages are titled by their name.
         guard name.hasPrefix("account:") else { return name }
-        return allAccountCards.first { "account:" + $0.id == name }?.title ?? name
+        return openAccountCard?.title ?? name
     }
     private var tabItems: [GlassTabBar.Item] {
         var items = [GlassTabBar.Item(id: 0, title: L("概览", "Overview"), symbol: "square.grid.2x2")]
@@ -897,6 +1088,158 @@ public struct DashboardView: View {
         }
         .buttonStyle(.plain).accessibilityIdentifier("tab.\(index)")
         .accessibilityAddTraits(tab == index ? .isSelected : [])
+    }
+
+    /// Choose which subscription tiles the overview watches. Kept next to the section header so the
+    /// filter is discoverable without another settings page; ids persist across launches.
+    /// One monitor row per visible subscription, including vm2api Claude and Codex.
+    private func subscriptionMonitorEntries(normal: [AccountPresentation], vmAccounts: [VM2APIQuota.Account],
+                                            now: TimeInterval) -> [SubscriptionMonitorEntry] {
+        var entries: [SubscriptionMonitorEntry] = []
+        for card in normal {
+            let tool = card.title.components(separatedBy: " · ").first ?? card.title
+            let group = card.planTitle == nil ? L("账号", "Accounts") : L("订阅套餐", "Plans")
+            entries.append(SubscriptionMonitorEntry(id: card.id, title: card.title,
+                                                    subtitle: subscriptionSubtitle(card, now: now),
+                                                    group: group, tint: Brand.color(tool),
+                                                    symbol: AccountQuotaGrid.symbol(tool)))
+        }
+        for account in vmAccounts {
+            let card = account.card(now: now)
+            entries.append(SubscriptionMonitorEntry(id: account.id, title: account.title,
+                                                    subtitle: subscriptionSubtitle(card, now: now),
+                                                    group: "vm2api · " + account.provider.title,
+                                                    tint: Brand.color(account.provider.title),
+                                                    symbol: AccountQuotaGrid.symbol(account.provider.title)))
+        }
+        return entries
+    }
+
+    private func subscriptionSubtitle(_ card: AccountPresentation, now: TimeInterval) -> String {
+        let quotas = card.displayQuotas(at: now)
+        guard !quotas.isEmpty else { return card.planNote ?? L("额度暂不可读", "Quota unavailable") }
+        return quotas.prefix(2).map { quota in
+            let label = quota.window == "week" ? L("周", "Wk") : quota.window
+            let stale = !(quota.trusted && now - quota.capturedAt <= 600)
+            return "\(label) \(Int(quota.usedPercent.rounded()))%" + (stale ? " · " + L("旧", "old") : "")
+        }.joined(separator: " · ")
+    }
+
+    /// vm2api accounts use exactly the normal quota cards; this is only a small source heading.
+    @ViewBuilder
+    private func vm2apiSection(cards: [AccountPresentation], accounts: [VM2APIQuota.Account]) -> some View {
+        let snapshot = vm2apiQuota.snapshot
+        let claudeTotal = accounts.filter { $0.provider == .claude }.count
+        let codexTotal = accounts.filter { $0.provider == .codex }.count
+        let claudeShown = cards.filter { $0.title.hasPrefix("Claude") }.count
+        let codexShown = cards.filter { $0.title.hasPrefix("Codex") }.count
+        if accounts.isEmpty {
+            if !snapshot.error.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle").font(VG.caption).foregroundStyle(.orange)
+                    Text(L("vm2api 额度读取失败：", "Cannot read vm2api quotas: ") + snapshot.error)
+                        .font(VG.caption).foregroundStyle(.secondary).lineLimit(2)
+                    Spacer(minLength: 2)
+                    Button(L("重试", "Retry")) { vm2apiQuota.refreshIfNeeded(force: true) }
+                        .buttonStyle(.plain).font(VG.caption)
+                }
+                .padding(.vertical, 7).padding(.horizontal, 9)
+                .glassTile(tint: Brand.color("Claude"), padding: 0, radius: 11)
+            } else {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text(L("正在读取 vm2api 的 Claude / Codex 额度…", "Reading vm2api Claude/Codex quotas…"))
+                        .font(VG.caption).foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 7).padding(.horizontal, 9)
+                .glassTile(tint: Brand.color("Claude"), padding: 0, radius: 11)
+            }
+        } else if !cards.isEmpty {
+            let selectedIDs = Set(cards.map(\.id))
+            let readable = cards.filter { card in accounts.first { $0.id == card.id }?.hasCurrentWindow(now: nowTS) ?? true }
+            let empty = accounts.filter { !$0.hasCurrentWindow(now: nowTS) && selectedIDs.contains($0.id) }
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text("vm2api").font(VG.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text("\(claudeShown)/\(claudeTotal) Claude · \(codexShown)/\(codexTotal) Codex")
+                        .font(.system(size: 9 * VG.scale)).foregroundStyle(.tertiary).monospacedDigit()
+                    VGInfoButton(title: L("vm2api 额度", "vm2api quotas"),
+                                 text: L("vm2api 同时跑 Claude 账号和 Codex OAuth：Claude 来自 accounts 库里的 5h/7d 官方窗口，Codex 来自 quota-reader 的确认读数。两者都是普通订阅账号，走同一套卡片和监控勾选；额度分别计算，不相加。数据只读，后台每 5 分钟采样一次。\(empty.isEmpty ? "" : "\n\n没有额度样本的账号不占卡片位，收在下面一行；点开详情可以看它的状态和最后一次读数。")",
+                                         "vm2api runs both Claude accounts and Codex OAuth: Claude comes from the official 5h/7d windows in its accounts database, Codex from the quota-reader cache. Both are ordinary subscriptions using the same cards and monitor selection; quotas are counted separately and never summed. Reads are read-only and sampled every five minutes in the background.\(empty.isEmpty ? "" : "\n\nAccounts without a quota sample are folded into one row instead of taking card space; the details page shows their status and last reading.")"))
+                    if !snapshot.claudeError.isEmpty || !snapshot.codexError.isEmpty {
+                        Image(systemName: "exclamationmark.triangle").font(.system(size: 9)).foregroundStyle(.orange)
+                            .help([snapshot.claudeError, snapshot.codexError].filter { !$0.isEmpty }.joined(separator: "\n"))
+                    }
+                    Spacer(minLength: 4)
+                    if snapshot.fetchedAt > 0 {
+                        HStack(spacing: 2) {
+                            Image(systemName: "clock.arrow.circlepath").font(.system(size: 8, weight: .semibold))
+                            Text(UIFormat.agoShort(max(0, Int(nowTS - snapshot.fetchedAt)))).monospacedDigit()
+                        }.font(.system(size: 9 * VG.scale)).foregroundStyle(.tertiary)
+                    }
+                    Button { openDetail(Self.vm2apiPage) } label: {
+                        Image(systemName: "chevron.right").font(VG.caption).foregroundStyle(.secondary)
+                    }.buttonStyle(.plain).help(L("查看每台 VM 的 Claude / Codex 额度与走势", "Open each VM’s Claude/Codex quotas and trends"))
+                }
+                .padding(.horizontal, 2)
+                if !readable.isEmpty {
+                    AccountQuotaGrid(cards: readable, now: nowTS, values: quotaValues, money: quotaMoneyText,
+                                     open: { _ in openDetail(Self.vm2apiPage) })
+                }
+                if !empty.isEmpty {
+                    vm2apiNoSampleStrip(empty)
+                }
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    /// No-sample accounts should not read as four broken cards. One quiet row keeps them discoverable
+    /// without spending the overview on repeated "unavailable" tiles.
+    private func vm2apiNoSampleStrip(_ accounts: [VM2APIQuota.Account]) -> some View {
+        VStack(spacing: 4) {
+            ForEach(VM2APIQuota.Provider.allCases, id: \.self) { provider in
+                let rows = accounts.filter { $0.provider == provider }
+                if !rows.isEmpty {
+                    Button { openDetail(Self.vm2apiPage) } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "waveform.slash").font(.system(size: 9 * VG.scale, weight: .semibold))
+                                .foregroundStyle(Brand.color(provider.title).opacity(0.8))
+                            Text(L("\(rows.count) 个 \(provider.title) 账号暂无当前额度", "\(rows.count) \(provider.title) account(s) without a current quota"))
+                                .font(VG.font(9.5, .medium)).foregroundStyle(.secondary)
+                            Text(rows.map(\.vmID).joined(separator: " · "))
+                                .font(.system(size: 9 * VG.scale)).foregroundStyle(.tertiary)
+                                .lineLimit(1).truncationMode(.tail)
+                            Spacer(minLength: 4)
+                            Text(L("详情", "Details")).font(VG.font(9)).foregroundStyle(.secondary)
+                            Image(systemName: "chevron.right").font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.vertical, 6).padding(.horizontal, 9)
+                        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.primary.opacity(0.035)))
+                        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .strokeBorder(Color.primary.opacity(0.06), lineWidth: 0.6))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(L("这些账号在 vm2api 里还没有产生额度读数；点开看状态、账号类型和最后一次读数，不占卡片位。",
+                            "These accounts have not produced a quota reading yet; open for status, credential type and last reading. They are folded here to save card space."))
+                }
+            }
+        }
+    }
+
+    private var monitorHiddenRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "eye.slash").font(VG.caption).foregroundStyle(.secondary)
+            Text(L("订阅已按监控选择隐藏", "Subscriptions hidden by the monitor filter")).font(VG.caption).foregroundStyle(.secondary)
+            Spacer(minLength: 4)
+            Button(L("显示全部", "Show all")) { monitoredSubsRaw = "" }
+                .buttonStyle(.plain).font(VG.caption)
+        }
+        .padding(.vertical, 7).padding(.horizontal, 9)
+        .glassTile(tint: Glass.money, padding: 0, radius: 11)
     }
 
     /// Settings get their own page rather than stretching the current panel.
@@ -983,10 +1326,16 @@ public struct DashboardView: View {
         guard page != drillDown else { return }
         if let current = drillDown { detailBackStack.append(current) }
         drillDown = page
+        detailAccountCard = page.hasPrefix("account:")
+            ? allAccountCards.first { "account:" + $0.id == page }
+            : nil
     }
 
     private func goBack() {
         drillDown = detailBackStack.popLast()
+        detailAccountCard = drillDown.flatMap { page in
+            page.hasPrefix("account:") ? allAccountCards.first { "account:" + $0.id == page } : nil
+        }
     }
 
     private func openHealth() {
@@ -1013,12 +1362,14 @@ public struct DashboardView: View {
     @ViewBuilder
     var tabContent: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if let selected = drillDown, selected.hasPrefix("account:"),
-               let card = allAccountCards.first(where: { "account:" + $0.id == selected }) {
+            if let selected = drillDown, selected.hasPrefix("account:"), let card = openAccountCard {
                 AccountDetailView(card: card, points: history.accountUsage.points,
                                   coverageStart: card.account.flatMap { history.accountUsage.coverageStartByAccount[$0.key] },
                                   capturedAt: history.capturedAt, now: nowTS,
-                                  mode: displayCurrency, quote: exchangeRates.quote)
+                                  mode: displayCurrency, quote: exchangeRates.quote, values: quotaValues)
+            } else if drillDown == Self.vm2apiPage {
+                VM2APIQuotaDetail(snapshot: vm2apiQuota.snapshot, history: vm2apiQuota.history, now: nowTS,
+                                  refresh: { vm2apiQuota.refreshIfNeeded(force: true) })
             } else if drillDown == Self.accountsPage {
                 accountUsageList()
             } else if drillDown == Self.devicesPage {
@@ -1207,9 +1558,30 @@ public struct DashboardView: View {
         // Subscription plans without a sign-in identity (Grok / GLM / Gemini) join the same ring grid.
         let plans = PlanQuota.collect(local: currentLLMs, remote: report.remoteLLMs, now: nowTS)
         let planCards = plans.map(\.card)
-        let visible = Array((readable + pending).prefix(count)) + planCards
-        let pendingIDs = Set(pending.map(\.id))
-        let fullValue = fullValueTexts(visible)
+        let allCards = readable + pending + planCards
+        let vmAccounts = vm2apiQuota.snapshot.accounts
+        // Interleave providers by VM so Codex does not hide below eight Claude cards: vm-03 Claude
+        // sits next to vm-03 Codex, and both are normal quota cards.
+        let vmCards = vmAccounts.sorted { a, b in
+            if a.vmID != b.vmID { return a.vmID.localizedStandardCompare(b.vmID) == .orderedAscending }
+            return a.provider == .claude
+        }.map { $0.card(now: nowTS) }
+        let allMonitorCards = allCards + vmCards
+        let monitorEntries = subscriptionMonitorEntries(normal: allCards, vmAccounts: vmAccounts, now: nowTS)
+        // Monitor selection: empty = the default compact list; explicit ids = those tiles only.
+        let visible: [AccountPresentation] = {
+            if monitoredSubs.isEmpty { return Array((readable + pending).prefix(count)) + planCards }
+            if hidesAllSubs { return [] }
+            return allCards.filter { isSubMonitored($0.id) }
+        }()
+        let visibleVM: [AccountPresentation] = {
+            if monitoredSubs.isEmpty { return vmCards }
+            if hidesAllSubs { return [] }
+            return vmCards.filter { isSubMonitored($0.id) }
+        }()
+        let pendingIDs = Set(pending.map(\.id)).intersection(visible.map(\.id))
+        // Newest quota reading on any visible tile: the answer to "when was this refreshed".
+        let newestReading = (visible + visibleVM).flatMap { $0.currentQuotas(at: nowTS) }.map(\.capturedAt).max()
         return VStack(alignment: .leading, spacing: 6) {
             TodayHeroTile(snapshot: history, scope: deviceScope, hosts: report.remoteHosts, now: nowTS,
                           mode: displayCurrency, quote: exchangeRates.quote,
@@ -1220,10 +1592,25 @@ public struct DashboardView: View {
             HStack(spacing: 6) {
                 Text(L("订阅", "Subscriptions")).font(VG.caption.weight(.semibold)).foregroundStyle(.secondary)
                 VGInfoButton(title: L("订阅额度", "Subscription quotas"),
-                             text: L("Grok / GLM / Gemini 订阅取各设备里最近一次读到的额度（GLM 按 key 指纹合并）；Gemini 没有可读的额度接口时显示「暂不可读」。「满额」学 sub2api 的算法：取这个额度窗口最近几小时的采样，用这段时间的请求按 API 价折算的花费 ÷ 额度涨了几个百分点，至少涨 3 个点才算，是估算。账号数只统计设备当前确认登录的订阅账号，同一账号跨设备合并。历史账号不计入；设备暂时联系不上时，最近 6 小时有额度的账号以淡色加 ? 显示，不计入账号数。外环为周额度，内环为 5 小时额度，均表示已用。", "Grok / GLM / Gemini use the most recent quota read on any device (GLM merged by key fingerprint); Gemini shows “not readable” without a quota source. “Full” follows sub2api: API-priced spend since the window’s oldest recent sample ÷ the points used, once it has moved at least 3 points; an estimate. Only currently confirmed subscription logins are counted, deduplicated across devices. Historical accounts are excluded; while a device is unreachable, accounts with quota in the last 6 h are shown dimmed with ? and not counted. Outer ring: weekly quota used. Inner ring: 5-hour quota used."))
+                             text: L("百分比是官方额度已用多少。每个窗口下面一行是钱：\n·「已用」= 本周期开始到现在的请求按 API 价折算的花费（不是实付账单），回答这一管已经花掉多少；\n·「满额」= 整个额度约值多少。本周期记录完整时直接用「整周期花费 ÷ 已用百分比」；不完整时退回 sub2api 的算法：取最近几小时的额度采样，用这段时间的花费 ÷ 额度涨的百分点，并合并每台设备自己的采样取中位数（至少涨 3 个点、跨度 15 分钟以上才算），鼠标悬停可看区间。\nCPA 和本机 Codex 登录的是同一个账号、共用同一个额度桶，设备日志与 CPA 的用量相加、一起消耗这个百分比（本机代理是 CLI 镜像，不重复计入），ChatGPT 订阅内请求（chatgpt-web 池）也算进同一个额度；账号数只统计设备当前确认登录的订阅账号，同一账号跨设备合并，历史账号不计入，设备暂时联系不上时以淡色加 ? 显示。外环为周额度，内环为 5 小时额度。API 等价金额统一按 USD 展示：国产模型的人民币价与 DSH 账本按参考汇率折算；汇率不可用时保留原币，不做猜测。vm2api 的 Claude / Codex 也是普通账号：Claude 来自 vm2api accounts 的官方窗口，Codex 来自 quota-reader；两边额度分别计算，不相加。", "The percentage is official quota used. The line under each window is money:\n· “used” = API-priced spend from the cycle start to now (not a bill), i.e. how much of this refill is gone;\n· “full” = what the whole window is worth. With the whole cycle recorded it is spend ÷ percent used; otherwise it falls back to the sub2api method (spend ÷ percentage points moved since the window’s baseline sample), taking the median of every device’s own sample (≥ 3 points over ≥ 15 minutes); hover for the range.\nThe CPA relay and this machine's Codex share one login and one quota bucket, so device logs and CPA usage are added and both consume this percentage (the local proxy mirrors CLI calls and is not double-counted); subscription-included requests (chatgpt-web pool) count against the same Codex quota. Only currently confirmed logins are counted, deduplicated across devices; historical accounts are excluded and unreachable devices are shown dimmed with ?. Outer ring: weekly quota. Inner ring: 5-hour quota. API-equivalent amounts are shown in USD: CNY-priced domestic models and DSH’s ledger are converted at the reference rate; without a usable rate the original currency is kept, never guessed. vm2api Claude/Codex are ordinary accounts too: Claude comes from vm2api’s official account windows, Codex from its quota-reader; each is counted separately, never summed."))
+                SubscriptionMonitorControl(entries: monitorEntries, isSelected: isSubMonitored,
+                                           toggle: { id in toggleSub(id, all: allMonitorCards.map(\.id)) },
+                                           selectAll: { monitoredSubsRaw = "" },
+                                           selectNone: { monitoredSubsRaw = "__none__" },
+                                           isPresented: $monitorShown)
                 if let error = accountLedgerError {
                     Image(systemName: "exclamationmark.triangle").font(VG.caption).foregroundStyle(.orange)
                         .help(L("周期记录读写失败：", "Cycle history unavailable: ") + error)
+                }
+                if let newestReading, newestReading > 0 {
+                    HStack(spacing: 2) {
+                        Image(systemName: "clock.arrow.circlepath").font(.system(size: 9 * VG.scale, weight: .semibold))
+                        Text(UIFormat.agoShort(max(0, Int(nowTS - newestReading)))).monospacedDigit()
+                    }
+                    .font(VG.caption).foregroundStyle(.tertiary).lineLimit(1).fixedSize()
+                    .accessibilityIdentifier("accounts.updated")
+                    .help(L("最近一次额度读数：\(UIFormat.clock(newestReading))。每台设备按自己的采集节奏刷新；表盘上带钟表图标的窗口是旧读数。",
+                            "Newest quota reading: \(UIFormat.clock(newestReading)). Each device refreshes on its own collection cadence; a window with a clock icon is an older sample."))
                 }
                 Spacer()
                 Button { openDetail(Self.accountsPage) } label: {
@@ -1239,11 +1626,19 @@ public struct DashboardView: View {
                     .help(L("当前登录账号与设备确认状态", "Current logins and device confirmation status"))
             }
             .padding(.horizontal, 2)
-            AccountQuotaGrid(cards: visible, now: nowTS, unconfirmedIDs: pendingIDs, fullValue: fullValue, open: { id in
-                if id.hasPrefix("plan:"), let plan = plans.first(where: { "plan:" + $0.id == id }) {
-                    if currentLLMs.contains(where: { $0.name == plan.runtimeName }) { openDetail(plan.runtimeName) }
-                } else { openDetail("account:" + id) }
-            })
+            if visible.isEmpty && !monitoredSubs.isEmpty && hidesAllSubs {
+                monitorHiddenRow
+            } else if !visible.isEmpty {
+                AccountQuotaGrid(cards: visible, now: nowTS, unconfirmedIDs: pendingIDs, values: quotaValues,
+                                 money: quotaMoneyText, open: { id in
+                    if id.hasPrefix("plan:"), let plan = plans.first(where: { "plan:" + $0.id == id }) {
+                        if currentLLMs.contains(where: { $0.name == plan.runtimeName }) { openDetail(plan.runtimeName) }
+                    } else { openDetail("account:" + id) }
+                })
+            }
+            if !hidesAllSubs {
+                vm2apiSection(cards: visibleVM, accounts: vmAccounts)
+            }
             APIQuotaSection(providers: currentAPI.providers, dshBalance: UsageHistory.dshBalance,
                             plans: plans, now: nowTS,
                             openAPI: { if showAPITab { tab = 1 } else { openDetail(Self.apiPage) } })
@@ -1256,23 +1651,7 @@ public struct DashboardView: View {
         }
     }
 
-    /// sub2api-style "whole quota is worth" per tile, from the window that moved the most since its baseline.
-    private func fullValueTexts(_ cards: [AccountPresentation]) -> [String: String] {
-        var out: [String: String] = [:]
-        // Baselines are at most 6 h old, so only recent points matter; deduplicate those once for every tile.
-        let cutoff = nowTS - 7 * 3600
-        let recent = AccountUsage.deduplicated(history.accountUsage.points.filter { $0.timestamp >= cutoff })
-        for card in cards {
-            let candidates = card.currentQuotas(at: nowTS).compactMap { q -> (AccountQuotaObservation, [String: Double])? in
-                AccountUsage.recentCapacity(q, points: recent).map { (q, $0) }
-            }
-            guard let (q, value) = candidates.max(by: { ($0.0.usedPercent - ($0.0.baselinePercent ?? 0)) < ($1.0.usedPercent - ($1.0.baselinePercent ?? 0)) })
-            else { continue }
-            out[card.id] = "≈" + moneyText(value) + " / " + (q.window == "week" ? L("周", "wk") : q.window)
-        }
-        return out
-    }
-
+    static let vm2apiPage = "__vm2api_quota__"
     private static let accountsPage = "__accounts__"
     private static let accountHistoryPage = "__account_history__"
     private var currencyPicker: some View {

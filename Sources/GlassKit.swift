@@ -215,6 +215,9 @@ struct GlassBars: View {
     var tint: Color
     var tintEnd: Color? = nil
     var highlightLast = true
+    /// Selected bar (for a per-day drill-down); `onSelect` makes the bars tappable.
+    var selected: Int? = nil
+    var onSelect: ((Int) -> Void)? = nil
     var format: (Double) -> String = { String(format: "%.2f", $0) }
     @State private var hovered: Int?
 
@@ -223,21 +226,7 @@ struct GlassBars: View {
         let average = values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
         GeometryReader { geo in
             ZStack(alignment: .bottomLeading) {
-                HStack(alignment: .bottom, spacing: 3) {
-                    ForEach(values.indices, id: \.self) { index in
-                        let isLast = highlightLast && index == values.count - 1
-                        let height = max(2, geo.size.height * CGFloat(values[index] / top))
-                        RoundedRectangle(cornerRadius: 3, style: .continuous)
-                            .fill(LinearGradient(colors: [tintEnd ?? tint, tint], startPoint: .top, endPoint: .bottom))
-                            .opacity(hovered == index ? 1 : isLast ? 0.95 : values[index] > 0 ? 0.45 : 0.15)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: height)
-                            .onHover { inside in hovered = inside ? index : (hovered == index ? nil : hovered) }
-                            .help((labels.indices.contains(index) ? labels[index] + " · " : "") + format(values[index]))
-                            .accessibilityLabel(labels.indices.contains(index) ? labels[index] : String(index + 1))
-                            .accessibilityValue(format(values[index]))
-                    }
-                }
+                bars(geo: geo, top: top)
                 if average > 0 {
                     Rectangle()
                         .fill(Color.primary.opacity(0.35))
@@ -247,6 +236,36 @@ struct GlassBars: View {
                 }
             }
         }
+    }
+
+    private func bars(geo: GeometryProxy, top: Double) -> some View {
+        HStack(alignment: .bottom, spacing: 3) {
+            ForEach(values.indices, id: \.self) { index in
+                bar(index: index, geo: geo, top: top)
+            }
+        }
+    }
+
+    private func bar(index: Int, geo: GeometryProxy, top: Double) -> some View {
+        let isLast = highlightLast && index == values.count - 1
+        let height = max(2, geo.size.height * CGFloat(values[index] / top))
+        let label = labels.indices.contains(index) ? labels[index] : String(index + 1)
+        let help = (labels.indices.contains(index) ? labels[index] + " · " : "") + format(values[index])
+            + (onSelect == nil ? "" : "\n" + L("点击查看当天明细", "Click for that day's details"))
+        return RoundedRectangle(cornerRadius: 3, style: .continuous)
+            .fill(LinearGradient(colors: [tintEnd ?? tint, tint], startPoint: .top, endPoint: .bottom))
+            .opacity(hovered == index || selected == index ? 1 : isLast ? 0.95 : values[index] > 0 ? 0.45 : 0.15)
+            .overlay(RoundedRectangle(cornerRadius: 3, style: .continuous)
+                .strokeBorder(Color.primary.opacity(selected == index ? 0.5 : 0), lineWidth: 1))
+            .frame(maxWidth: .infinity)
+            .frame(height: height)
+            .contentShape(Rectangle())
+            .onTapGesture { onSelect?(index) }
+            .onHover { inside in hovered = inside ? index : (hovered == index ? nil : hovered) }
+            .help(help)
+            .accessibilityLabel(label)
+            .accessibilityValue(format(values[index]))
+            .accessibilityAddTraits(onSelect == nil ? [] : .isButton)
     }
 }
 

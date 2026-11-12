@@ -19,3 +19,9 @@ vg-watch.command
 /review-shots/
 
 /build-obs/
+
+# Local-only working data: personal usage analysis, build backups, side projects.
+/analysis/
+/build-backup/
+/magpie-vm2api/
+/docs/legacy/

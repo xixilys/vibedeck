@@ -26,6 +26,30 @@ public final class UsageHistory {
             ctx += other.ctx; cacheRead += other.cacheRead; cacheWrite += other.cacheWrite
             out += other.out; think += other.think
         }
+        mutating func subtract(_ other: ModelTotals) {
+            ctx -= other.ctx; cacheRead -= other.cacheRead; cacheWrite -= other.cacheWrite
+            out -= other.out; think -= other.think
+        }
+    }
+
+    /// Per-model token use for one day on one source. Costs are API-equivalent values (not subscription
+    /// bills); unpriced requests are counted so the Statistics page can say the amount is a lower bound.
+    public struct ModelUse: Equatable {
+        public var usage = ModelTotals()
+        public var requests = 0
+        public var costByCurrency: [String: Double] = [:]
+        public var unpricedRequests = 0
+        public var tokenTotal: Int64 { usage.tokenTotal }
+        public init() {}
+        mutating func add(usage: ModelTotals, requests: Int, cost: (value: Double, currency: String)?) {
+            self.usage.add(usage); self.requests += requests
+            if let cost { costByCurrency[cost.currency, default: 0] += cost.value }
+            else { unpricedRequests += requests }
+        }
+        mutating func merge(_ other: ModelUse) {
+            usage.add(other.usage); requests += other.requests; unpricedRequests += other.unpricedRequests
+            for (currency, value) in other.costByCurrency { costByCurrency[currency, default: 0] += value }
+        }
     }
 
     public struct Totals: Codable, Equatable {
@@ -90,6 +114,9 @@ public final class UsageHistory {
         public var costByCurrency: [String: Double] = [:]
         public var costBySource: [String: [String: Double]] = [:]
         public var costByModel: [String: [String: Double]] = [:]
+        /// day → source → model → tokens / requests / API-equivalent cost. Powers the per-model Statistics tile
+        /// without re-reading 380k records on the main thread.
+        public var modelUsageDays: [String: [String: [String: ModelUse]]] = [:]
         public var todayCostBySource: [String: [String: Double]] = [:]
         public var todayBySource: [String: Totals] = [:]
         /// 每日花费（主币种），给热力图 tooltip / 柱状图
@@ -301,7 +328,7 @@ public final class UsageHistory {
             for r in records.values {
                 for x in [text(r.id), text(r.source), text(r.model), text(r.session), text(r.tier), r.timestamp.bitPattern,
                           UInt64(bitPattern: r.usage.ctx), UInt64(bitPattern: r.usage.cacheRead), UInt64(bitPattern: r.usage.cacheWrite),
-                          UInt64(bitPattern: r.usage.out), UInt64(bitPattern: r.usage.think), r.cumulative ? 1 : 0,
+                          UInt64(bitPattern: r.usage.out), UInt64(bitPattern: r.usage.think), r.cumulative ? UInt64(1) : UInt64(0),
                           r.cw1h.map { UInt64(bitPattern: $0) } ?? UInt64.max] { word(x) }
             }
             return PackedRows(strings: strings, rows: data)
@@ -596,18 +623,58 @@ public final class UsageHistory {
     /// 下次从旧 offset 重读，记录按 requestId/行偏移做键，重复读不会重复计数。
     private var dirty = false
     private var summaryDirty = Set<String>()
+    /// Bumped only when accounting content (records / frozen buckets / source identity) changes. Metadata
+    /// updates such as a remote cursor must not force a 700k-point rebuild every scan.
+    private var contentGeneration = 0
+    private var lastSummarizedGeneration = -1
+    private var lastSummaryDay = ""
+    private var lastPricingStamp = ""
+    private var lastRemoteStamp = ""
+    /// Frozen buckets are the only input to lifetime groups; they change at most once an hour now.
+    private var frozenGeneration = 0
+    private var historicalBuiltGeneration = -1
+    private var historicalGroups: [AccountUsageGroup] = []
+    private var historicalUnassigned = AccountUsageTotals()
     private var nextFreezeAt: [String: TimeInterval] = [:]
     private var fileSummaries: [String: FileSummary] = [:]
+    /// One concatenated ledger for all files. Per-file summaries only keep ranges into it, which avoids
+    /// thousands of spare-capacity arrays (they measured ~530 MB for ~145 MB of actual points).
+    private let ledgerStore = AccountPointLedger()
+    private var accountLedgerRanges: [String: Range<Int>] = [:]
     private var priceData: Data?
     private var summaryTimeZone = ""
     private var summaryPricesLoaded = false
+    /// The USD rate used when file summaries were priced; a rate change invalidates those summaries.
+    private var summaryUSDPerCNY: Double?
     private var pricingWarnings = Set<String>()
     private var migrationPending = false
     private var freezingEnabled = true
     private var migrationError: String?
     private var frozenClaudeIDs: [String: Set<String>] = [:]
+
+    /// Per-phase timing for `--bench-history`, written on the scan worker and read only after `refreshNow()`.
+    struct ScanBenchmark {
+        var total = 0.0, loadCache = 0.0, discoverFiles = 0.0, processFiles = 0.0, remote = 0.0, ingest = 0.0, pricing = 0.0
+        var freeze = 0.0, snapshot = 0.0, fileSummary = 0.0, winnerScan = 0.0, merge = 0.0, aggregate = 0.0
+        var files = 0, fileSummaries = 0, records = 0, frozenBuckets = 0, points = 0, identified = 0, groups = 0
+        var duplicates = 0
+    }
+    private(set) var benchmark: ScanBenchmark?
+    private var benchFileSummary = 0.0
+    private var benchWinnerScan = 0.0
+    private var benchMerge = 0.0
+    private var benchAggregate = 0.0
+    /// Source → request id → winning log path from the last summarize; the base for scoped invalidation.
+    private var claudeWinnerPaths: [String: [String: String]] = [:]
+    private var benchDuplicates = 0
+    private var benchPricing = 0.0
     private static let rawWindow: TimeInterval = 7 * 86400
     private static let forecastWindow: TimeInterval = 35 * 86400
+    /// A record crossing the 7-day line is allowed to stay raw for another hour. Freezing one row at a time
+    /// used to bump the accounting generation (and rebuild the 700k-point snapshot) on every 2-minute scan.
+    private static let freezeGrace: TimeInterval = 3600
+    private static let trimEvery: TimeInterval = 600
+    private var lastTrimAt: TimeInterval = 0
     private var savedAt: TimeInterval = 0
     private static let saveEvery: TimeInterval = 1800
     private static let scanEvery: TimeInterval = 120
@@ -657,6 +724,9 @@ public final class UsageHistory {
     public func refreshSoon() { worker.async { [weak self] in
         guard let self else { return }
         self.fileSummaries.removeAll()
+        self.ledgerStore.points.removeAll()
+        self.accountLedgerRanges.removeAll()
+        self.lastSummarizedGeneration = -1
         self.scan(forceRemote: true)
     } }
 
@@ -863,6 +933,10 @@ public final class UsageHistory {
             precondition(legacyRoundtrip.records[r.id]?.account == nil && legacyRoundtrip.records.count == 2)
             history.cache.files["fixture"] = file
             let before = history.summarize()
+            // Per-model daily usage feeds the Statistics tile without a second pass over the records.
+            let modelUse = before.modelUsageDays.values.compactMap { $0["Codex"]?["fixture"] }.first
+            precondition(modelUse?.requests == 2 && modelUse?.usage.ctx == 200,
+                         "per-model day totals: \(String(describing: modelUse))")
             history.freezeOldRecords(now: now)
             let frozen = history.cache.files["fixture"]!
             precondition(frozen.frozen?.count == 2 && Set(frozen.frozen!.compactMap { $0.account?.key }).count == 2)
@@ -940,24 +1014,47 @@ public final class UsageHistory {
 
     // MARK: - 扫描
 
+    /// Cheap fingerprint of the two files that can change accounting without any log changing: the user
+    /// price table and the exchange-rate quote. Without this, the "nothing changed" fast path would keep
+    /// showing costs priced with the previous file until a log happened to append.
+    private static func pricingStamp(home: String) -> String {
+        func probe(_ path: String) -> String {
+            guard let stat = vgFileStat(path) else { return "-" }
+            return "\(stat.mtime):\(stat.size)"
+        }
+        return probe(home + "/.config/vibedeck/prices.json") + "|"
+            + probe(home + "/.config/vibedeck/exchange-rate.json") + "|"
+            + TimeZone.current.identifier
+    }
+
     private func scan(forceRemote: Bool = false) {
+        let clock = { Date().timeIntervalSinceReferenceDate }
+        let benchStart = clock()
+        var bench = ScanBenchmark()
+        benchFileSummary = 0; benchWinnerScan = 0; benchMerge = 0; benchAggregate = 0; benchPricing = 0
         errors = []
         if let migrationError { errors.insert(migrationError) }
         publishProgress(0, total: 0)
         loadCache()
+        bench.loadCache = clock() - benchStart
+        let afterLoad = clock()
         let paths = discoverFiles()
+        bench.discoverFiles = clock() - afterLoad
         let hosts = RemoteCollector.hosts()
         let now = Date().timeIntervalSince1970
         performanceCutoff = now - 86400
-        let refreshHosts = CommandLine.arguments.contains("--selftest") ? [] : hosts.filter {
+        let offline = CommandLine.arguments.contains("--selftest") || CommandLine.arguments.contains("--bench-history")
+        let refreshHosts = offline ? [] : hosts.filter {
             forceRemote || now - (remotePulledAt[$0] ?? 0) >= Self.remoteEvery
         }
         let units = paths.count + 1 + hosts.count
         publishProgress(0, total: units)
+        let beforeProcess = clock()
         for (index, item) in paths.enumerated() {
             autoreleasepool { process(item.path, source: item.source) }
             publishProgress(index + 1, total: units)
         }
+        bench.processFiles = clock() - beforeProcess
         // Baseline means collection has actually started, not the timestamp of an arbitrary old record.
         // Each known device/tool gets its own baseline; adding another device advances complete-account coverage.
         if errors.isEmpty {
@@ -968,21 +1065,61 @@ public final class UsageHistory {
                 }
             }
         }
+        let beforeIngest = clock()
         ingestOpenCode()
         ingestDSH()
         ingestGrok()
+        bench.ingest = clock() - beforeIngest
         publishProgress(paths.count + 1, total: units)
         trimTimings(now: now)
         // SSH 冷扫描可能很慢；先让本机的新数据可见，远端仍保留上次记录。
         // 两次汇总都在同一个 worker 上，快照交换以外不持锁。
         if !refreshHosts.isEmpty {
-            publish(makeSnapshot(paths: paths, hosts: hosts, processed: paths.count + 1, total: units,
-                                 refreshingHosts: Set(refreshHosts), isScanning: true))
+            // Publish the previous ledger with a "scanning" flag instead of rebuilding it once more:
+            // a full summarize here was pure duplication of the one that runs after the remote ingest.
+            let beforeRemoteSnapshot = clock()
+            var progress = snapshot()
+            progress.isScanning = true
+            progress.processedFiles = paths.count + 1
+            progress.totalFiles = units
+            publish(progress)
+            bench.snapshot += clock() - beforeRemoteSnapshot
+            let beforeRemote = clock()
             ingestRemote(hosts: refreshHosts)
+            bench.remote = clock() - beforeRemote
             trimTimings(now: Date().timeIntervalSince1970)
         }
+        let beforeFreeze = clock()
         freezeOldRecords(now: now)
-        var result = makeSnapshot(paths: paths, hosts: hosts, processed: units, total: units)
+        bench.freeze = clock() - beforeFreeze
+        // Rebuilding the snapshot walks every cached file summary and copies the point ledger. If neither the
+        // accounting content nor the civil day changed, publish the previous snapshot with fresh capture/status
+        // fields instead. This is the difference between ~6 s CPU every 2 min and ~0.5 s while nothing happens.
+        let today = Self.dayKey(timestamp: now)
+        let pricingStamp = Self.pricingStamp(home: home)
+        let remoteStamp = hosts.sorted().joined(separator: ",") + "|"
+            + remoteCLIStatus.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ";") + "|"
+            + remoteStatus.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value ? 1 : 0)" }.joined(separator: ";")
+        let needsSummary = contentGeneration != lastSummarizedGeneration || today != lastSummaryDay
+            || pricingStamp != lastPricingStamp || remoteStamp != lastRemoteStamp
+            || cached.capturedAt == 0 || fileSummaries.isEmpty
+        let beforeSnapshot = clock()
+        var result: Snapshot
+        if needsSummary {
+            result = makeSnapshot(paths: paths, hosts: hosts, processed: units, total: units)
+            lastSummarizedGeneration = contentGeneration
+            lastSummaryDay = today
+            lastPricingStamp = pricingStamp
+            lastRemoteStamp = remoteStamp
+        } else {
+            result = snapshot()
+            result.isScanning = false
+            result.processedFiles = units
+            result.totalFiles = units
+            result.capturedAt = now
+            result.error = errors.sorted().joined(separator: "；")
+        }
+        bench.snapshot += clock() - beforeSnapshot
         cache.days = result.days
         cache.updatedAt = result.capturedAt
         if dirty, cache.updatedAt - savedAt >= Self.saveEvery {
@@ -1000,6 +1137,8 @@ public final class UsageHistory {
                    let original = try? JSONDecoder().decode(DiskCache.self, from: data) {
                     cache = original
                     fileSummaries.removeAll()
+                    ledgerStore.points.removeAll()
+                    accountLedgerRanges.removeAll()
                     result = makeSnapshot(paths: paths, hosts: hosts, processed: units, total: units)
                 }
             }
@@ -1007,6 +1146,28 @@ public final class UsageHistory {
         result.error = errors.sorted().joined(separator: "；")
         publish(result)
         log.notice("历史汇总完成：\(paths.count) 文件，\(result.days.count) 天，跳过 \(result.skippedRecords) 条不完整记录")
+        // A rebuild allocates a second ledger plus dedup indices; without this the allocator keeps those pages
+        // resident and the menu-bar memory readout shows the cold-scan peak forever.
+        malloc_zone_pressure_relief(nil, 0)
+        bench.total = clock() - benchStart
+        bench.fileSummary = benchFileSummary
+        bench.winnerScan = benchWinnerScan
+        bench.merge = benchMerge
+        bench.aggregate = benchAggregate
+        bench.pricing = benchPricing
+        bench.files = cache.files.count
+        bench.fileSummaries = fileSummaries.count
+        bench.records = cache.files.values.reduce(0) { $0 + $1.records.count }
+        bench.frozenBuckets = cache.files.values.reduce(0) { $0 + ($1.frozen?.count ?? 0) }
+        bench.points = result.accountUsage.points.count
+        bench.duplicates = benchDuplicates
+        bench.groups = result.accountUsage.groups.count
+        if CommandLine.arguments.contains("--bench-history") {
+            bench.identified = result.accountUsage.points.reduce(0) {
+                $0 + (($1.account != nil && $1.exactRequestID != nil) ? 1 : 0)
+            }
+            benchmark = bench
+        }
     }
 
     private func makeSnapshot(paths: [(path: String, source: String)], hosts: [String], processed: Int, total: Int,
@@ -1208,18 +1369,26 @@ public final class UsageHistory {
                 cli.metadataVersion = 1
                 cli.toolsVersion = 2
                 if !pull.turnLatencies.isEmpty { cli.turnLatencies = Self.mergedTurnLatencies((cli.turnLatencies ?? []) + pull.turnLatencies, now: now) }
+                var touched: [String: Record] = [:]
                 if !pull.sessionAccounts.isEmpty {
-                    for id in cli.records.keys {
-                        guard cli.records[id]?.account == nil, let session = cli.records[id]?.session,
+                    // Only records in this pull can be backfilled. Iterating all 120k retained rows on every
+                    // five-minute refresh was pure repeat work and kept the history worker busy for seconds.
+                    for record in pull.records {
+                        guard let old = cli.records[record.id] ?? touched[record.id], old.account == nil,
+                              let session = old.session,
                               let identity = pull.sessionAccounts[(session as NSString).lastPathComponent] else { continue }
-                        cli.records[id]?.account = identity
+                        var updated = old
+                        updated.account = identity
+                        cli.records[record.id] = updated
+                        touched[record.id] = updated
                     }
                 }
                 for record in pull.records {
                     if let old = cli.records[record.id], Self.kind(of: record.source) == .claude, !Self.prefer(record, over: old) { continue }
                     store(record, in: &cli)
+                    touched[record.id] = record
                 }
-                for record in cli.records.values {
+                for record in touched.values {
                     if let account = record.account {
                         recordAccountCoverage(account: account, source: record.source,
                             pool: AccountUsage.pool(model: record.model, source: record.source), now: now)
@@ -1579,10 +1748,62 @@ public final class UsageHistory {
     }
     private static func fingerprint(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 
+    /// Cache decode allocates a fresh String for every repeated model/source/account field. Intern them once
+    /// after loading so 600k points and 450k frozen buckets share the same backing storage.
+    private func internCacheStrings() {
+        var strings: [String: String] = [:]
+        func canon(_ value: inout String) {
+            if let existing = strings[value] { value = existing } else { strings[value] = value }
+        }
+        func canonOptional(_ value: inout String?) {
+            guard var text = value else { return }
+            canon(&text)
+            value = text
+        }
+        var accounts: [String: AccountIdentity] = [:]
+        func canonAccount(_ value: inout AccountIdentity?) {
+            guard let identity = value else { return }
+            if let existing = accounts[identity.key] { value = existing }
+            else { accounts[identity.key] = identity }
+        }
+        for (path, var state) in cache.files {
+            canon(&state.source)
+            canon(&state.model)
+            for (key, var record) in state.records {
+                canon(&record.source)
+                canon(&record.model)
+                canonOptional(&record.session)
+                canonOptional(&record.tier)
+                canonAccount(&record.account)
+                if var billed = record.billed { canon(&billed.currency); record.billed = billed }
+                state.records[key] = record
+            }
+            if var frozen = state.frozen {
+                for index in frozen.indices {
+                    canon(&frozen[index].source)
+                    canon(&frozen[index].model)
+                    canonOptional(&frozen[index].tier)
+                    canonAccount(&frozen[index].account)
+                    if var billed = frozen[index].billed {
+                        canon(&billed.currency)
+                        frozen[index].billed = billed
+                    }
+                }
+                state.frozen = frozen
+            }
+            cache.files[path] = state
+        }
+    }
+
+
     private func loadCache() {
         guard !loaded else { return }
         loaded = true
         guard FileManager.default.fileExists(atPath: cachePath) else { cache.parser = Self.parserVersion; return }
+        // The decompressed plist is ~140 MB and Foundation bridges it through autoreleased NSData.
+        // An explicit pool returns those pages before the first snapshot is built, instead of leaving
+        // them resident until the worker queue drains.
+        autoreleasepool {
         do {
             let url = URL(fileURLWithPath: cachePath)
             let data = try Data(contentsOf: url, options: .mappedIfSafe)
@@ -1596,6 +1817,8 @@ public final class UsageHistory {
             } else { decoded = try JSONDecoder().decode(DiskCache.self, from: data) }
             guard [3, 4].contains(decoded.version) else { errors.insert("历史缓存版本变化，已重新汇总"); return }
             cache = decoded
+            internCacheStrings()
+            historicalBuiltGeneration = -1
             if decoded.version == 3 {
                 do {
                     let backup = url.deletingLastPathComponent().appendingPathComponent("usage-daily.v3.bak.json")
@@ -1621,6 +1844,7 @@ public final class UsageHistory {
             for (path, state) in cache.files { indexTimings(path, state) }
             trimTimings(now: Date().timeIntervalSince1970)
         } catch { errors.insert("历史缓存无法读取，已重新汇总") }
+        }
         if (cache.parser ?? 1) < Self.parserVersion {
             // 新口径：仍在磁盘上的 Claude / Codex 日志重解析一次；已被清理的日志保留旧账
             let fm = FileManager.default
@@ -1634,6 +1858,7 @@ public final class UsageHistory {
     }
     @discardableResult private func saveCache() -> Bool {
         guard dirty else { return true }
+        return autoreleasepool { () -> Bool in
         do {
             let url = URL(fileURLWithPath: cachePath)
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -1655,6 +1880,7 @@ public final class UsageHistory {
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: cachePath)
             return true
         } catch { errors.insert("历史缓存保存失败，重启后需重新汇总"); return false }
+        }
     }
     private func readJSON(_ path: String) -> [String: Any]? {
         guard FileManager.default.fileExists(atPath: path) else { return nil }
@@ -1684,9 +1910,17 @@ public final class UsageHistory {
     private func updateFile(_ path: String, _ state: FileState) {
         let old = cache.files[path]
         guard old != state else { return }
-        if old?.records != state.records || old?.frozen != state.frozen || old?.frozenSessions != state.frozenSessions {
+        let contentChanged = old?.records != state.records || old?.frozen != state.frozen
+            || old?.frozenSessions != state.frozenSessions || old?.source != state.source
+            || old?.account != state.account || old?.model != state.model
+        if old?.frozen != state.frozen {
+            frozenGeneration &+= 1
+            historicalBuiltGeneration = -1
+        }
+        if contentChanged {
             summaryDirty.insert(path)
             nextFreezeAt[path] = nil
+            contentGeneration &+= 1
         }
         if old?.records != state.records { indexTimings(path, state) }
         // Metadata changes (offset, cursor, replay diagnostics) must also be persisted.
@@ -1704,6 +1938,10 @@ public final class UsageHistory {
 
     /// 只裁剪可观测性附加字段，不碰账目、HTTP 状态码、读取游标和旧缓存版本。
     private func trimTimings(now: TimeInterval) {
+        // Timing cleanup is a retention chore, not accounting: running it every two minutes created a
+        // fresh "changed" generation (and a full rebuild) for a handful of 24-hour-old samples.
+        guard now - lastTrimAt >= Self.trimEvery else { return }
+        lastTrimAt = now
         for path in cache.files.keys {
             guard var state = cache.files[path], let samples = state.turnLatencies else { continue }
             let trimmed = Self.mergedTurnLatencies(samples, now: now)
@@ -1718,6 +1956,7 @@ public final class UsageHistory {
             counts[key, default: 0] += 1
             if ref.timestamp < now - 86400 || counts[key]! > 500 { removals[path, default: []].insert(ref.id) }
         }
+        if !removals.isEmpty { contentGeneration &+= 1 }
         for (path, ids) in removals {
             guard var state = cache.files[path] else { continue }
             for id in ids {
@@ -1739,18 +1978,31 @@ public final class UsageHistory {
     }
 
     private func pricing() -> CostEngine {
+        let pricingStart = Date().timeIntervalSinceReferenceDate
+        defer { benchPricing += Date().timeIntervalSinceReferenceDate - pricingStart }
         let path = "\(home)/.config/vibedeck/prices.json"
         let data = try? Data(contentsOf: URL(fileURLWithPath: path))
         let zone = TimeZone.current.identifier
         if !summaryPricesLoaded || data != priceData || zone != summaryTimeZone {
             fileSummaries.removeAll()
+            historicalBuiltGeneration = -1
             pricingWarnings.removeAll()
             priceData = data
             summaryTimeZone = zone
             summaryPricesLoaded = true
         }
         let user = readJSON(path).map { ProcessScanner.PriceTable(json: $0) } ?? ProcessScanner.PriceTable()
-        return CostEngine(user: user, catalog: catalogOverride ?? PricingCatalog.builtin)
+        // API-equivalent money is shown as USD even for CNY-priced domestic rows and DSH's CNY ledger.
+        // The original recorded cost still uses each row's own currency.
+        let quote = ExchangeQuote.cached(home: home)
+        let rate = quote?.isUsable() == true ? quote?.cnyPerUSD : nil
+        if rate != summaryUSDPerCNY {
+            // Cached file summaries already contain converted equivalent costs; re-price them with the new rate.
+            fileSummaries.removeAll()
+            historicalBuiltGeneration = -1
+            summaryUSDPerCNY = rate
+        }
+        return CostEngine(user: user, catalog: catalogOverride ?? PricingCatalog.builtin, usdPerCNY: rate)
     }
 
     private static func peakDefinition(_ user: ProcessScanner.PriceTable) -> String {
@@ -1769,6 +2021,17 @@ public final class UsageHistory {
         var account: AccountIdentity?
         var exactRequestID: String?
         var billedCurrency: String? = nil
+    }
+
+    private static func winnerPaths(_ winners: [String: [String: (path: String, record: Record)]]) -> [String: [String: String]] {
+        var out: [String: [String: String]] = [:]
+        for (source, ids) in winners {
+            var rows: [String: String] = [:]
+            rows.reserveCapacity(ids.count)
+            for (id, win) in ids { rows[id] = win.path }
+            out[source] = rows
+        }
+        return out
     }
 
     private func claudeWinners() -> [String: [String: (path: String, record: Record)]] {
@@ -1792,9 +2055,9 @@ public final class UsageHistory {
         let candidates = cache.files.keys.filter { path in
             if nextFreezeAt[path] == nil {
                 let state = cache.files[path]!
-                let raw = state.records.values.map { $0.timestamp + Self.rawWindow }.min() ?? .infinity
+                let raw = state.records.values.map { $0.timestamp + Self.rawWindow + Self.freezeGrace }.min() ?? .infinity
                 let precise = (state.frozen ?? []).lazy.filter { $0.exactRequestID == nil && $0.timestamp != Self.hourStart($0.timestamp) }
-                    .map { $0.timestamp + Self.forecastWindow }.min() ?? .infinity
+                    .map { $0.timestamp + Self.forecastWindow + Self.freezeGrace }.min() ?? .infinity
                 nextFreezeAt[path] = min(raw, precise)
             }
             return now > (nextFreezeAt[path] ?? .infinity)
@@ -1845,7 +2108,12 @@ public final class UsageHistory {
                                  billed: record.billed))
             }
             state.frozen = Array(buckets.values)
-            if !oldRecords.isEmpty { state.frozenBefore = max(state.frozenBefore ?? 0, boundary) }
+            if !oldRecords.isEmpty {
+                state.frozenBefore = max(state.frozenBefore ?? 0, boundary)
+                contentGeneration &+= 1
+                frozenGeneration &+= 1
+                historicalBuiltGeneration = -1
+            }
             if state.frozenPeakDefinition == nil { state.frozenPeakDefinition = peakDefinition }
             updateFile(path, state)
         }
@@ -1886,12 +2154,14 @@ public final class UsageHistory {
 
     private func frozenEquivalentCost(_ bucket: FrozenBucket, engine: CostEngine) -> (value: Double, currency: String)? {
         // Existing frozen pricing handles request bands/peak grouping. Subscription records need a distinct API valuation.
-        if bucket.billed != nil || !CostEngine.isSubscriptionIncluded(bucket.model) { return frozenCost(bucket, engine: engine) }
+        if bucket.billed != nil || !CostEngine.isSubscriptionIncluded(bucket.model) {
+            return engine.usdValueOrNil(frozenCost(bucket, engine: engine))
+        }
         var b = bucket
         b.model = String(bucket.model.dropFirst("chatgpt-web/".count))
         var equivalent = engine
         if let exact = engine.user.row(for: bucket.model) { equivalent.user.rows[b.model.lowercased()] = exact }
-        return frozenCost(b, engine: equivalent)
+        return engine.usdValueOrNil(frozenCost(b, engine: equivalent))
     }
 
     private struct CostPoint {
@@ -1910,17 +2180,26 @@ public final class UsageHistory {
         var costByCurrency: [String: Double] = [:]
         var costBySource: [String: [String: Double]] = [:]
         var costByModel: [String: [String: Double]] = [:]
+        var modelUsage: [String: [String: [String: ModelUse]]] = [:]
         var hourly: [String: [String: [String: [Double]]]] = [:] // source → currency → day → 24 hours
         var points: [String: [CostPoint]] = [:]
         var performance: [PerformanceSample] = []
-        var accountPoints: [AccountUsagePoint] = []
         var models: [String: [String: [String: PerformanceTotals]]] = [:]
     }
 
+    /// Points are built transiently and folded into the one shared ledger; only this build result holds them.
+    private struct FileBuild {
+        var summary: FileSummary
+        var points: [AccountUsagePoint]
+    }
+
     private func summarizeFile(_ path: String, state: FileState, engine: CostEngine,
-                               claudeWinners: [String: [String: (path: String, record: Record)]], now: TimeInterval) -> FileSummary {
+                               claudeWinners: [String: [String: (path: String, record: Record)]], now: TimeInterval) -> FileBuild {
         var f = FileSummary()
+        var points: [AccountUsagePoint] = []
         var dayKeys = DayKeyCache()
+        let todayDay = dayKeys.key(now)
+        let horizonDay = dayKeys.key(now - Self.forecastWindow)
         f.dailySessions = state.frozenSessions ?? [:]
         for sources in f.dailySessions.values {
             for (source, keys) in sources { f.sessions[source, default: []].formUnion(keys) }
@@ -1944,7 +2223,9 @@ public final class UsageHistory {
                 f.hourly[source, default: [:]][c.currency, default: [:]][day] = Array(repeating: 0, count: 24)
             }
             f.hourly[source]?[c.currency]?[day]?[hour] += c.value
-            if at >= now - Self.forecastWindow {
+            // Only the live 24-hour window and the forecast-window edge day need exact timestamps; the merge
+            // reads just days >= yesterday and the horizon day, so keeping 35 days of CostPoints was dead weight.
+            if at >= now - 86400 || day == horizonDay {
                 f.points[day, default: []].append(CostPoint(timestamp: at, source: source, currency: c.currency, value: c.value, tokens: usage.tokenTotal))
             }
         }
@@ -1955,11 +2236,8 @@ public final class UsageHistory {
             add(source: bucket.source, model: bucket.model, at: bucket.timestamp, usage: bucket.usage, turns: bucket.turns,
                 cumulative: bucket.cumulative, cost: frozenCost(bucket, engine: engine))
             let cost = frozenEquivalentCost(bucket, engine: engine)
-            f.accountPoints.append(AccountUsagePoint(timestamp: bucket.timestamp, source: bucket.source, model: bucket.model,
-                account: bucket.account, pool: AccountUsage.pool(model: bucket.model, source: bucket.source), usage: bucket.usage,
-                requests: bucket.turns, equivalentCostByCurrency: cost.map { [$0.currency: $0.value] } ?? [:],
-                unpricedRequests: cost == nil ? bucket.turns : 0, exactRequestID: bucket.exactRequestID,
-                origin: Self.origin(of: bucket.source), timestampResolution: bucket.exactRequestID == nil && bucket.timestamp < now - Self.forecastWindow ? 3600 : 0))
+            f.modelUsage[dayKeys.key(bucket.timestamp), default: [:]][bucket.source, default: [:]][bucket.model, default: ModelUse()]
+                .add(usage: bucket.usage, requests: bucket.turns, cost: cost)
         }
         for record in state.records.values {
             let day = dayKeys.key(record.timestamp)
@@ -1968,16 +2246,20 @@ public final class UsageHistory {
             f.dailySessions[day, default: [:]][record.source, default: []].insert(session)
             if Self.kind(of: state.source) == .claude, claudeWinners[state.source]?[record.id]?.path != path { continue }
             let u = record.usage
-            let equivalent = record.billed.map { (value: $0.value, currency: $0.currency) }
+            let equivalent = engine.usdValueOrNil(record.billed.map { (value: $0.value, currency: $0.currency) })
                 ?? engine.equivalentCost(model: record.model, ctx: u.ctx, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
                 cacheWrite1h: record.cw1h ?? 0, out: u.out, tier: record.tier, at: Date(timeIntervalSince1970: record.timestamp))
-            f.accountPoints.append(AccountUsagePoint(timestamp: record.timestamp, source: record.source, model: record.model,
+            points.append(AccountUsagePoint(timestamp: record.timestamp, source: record.source, model: record.model,
                 account: record.account, pool: AccountUsage.pool(model: record.model, source: record.source), usage: u,
-                requests: 1, equivalentCostByCurrency: equivalent.map { [$0.currency: $0.value] } ?? [:],
+                requests: 1, cost: equivalent,
                 unpricedRequests: equivalent == nil ? 1 : 0, exactRequestID: AccountUsage.exactRequestID(record.id, source: record.source),
                 origin: Self.origin(of: record.source)))
-            let modelDay = dayKeys.key(record.timestamp)
-            f.models[modelDay, default: [:]][record.source, default: [:]][record.model, default: PerformanceTotals()].add(record)
+            f.modelUsage[day, default: [:]][record.source, default: [:]][record.model, default: ModelUse()]
+                .add(usage: u, requests: 1, cost: equivalent)
+            // Per-model performance detail is only consumed for today's card; older days live in modelUsage.
+            if todayDay == day {
+                f.models[day, default: [:]][record.source, default: [:]][record.model, default: PerformanceTotals()].add(record)
+            }
             if record.timestamp >= now - 86400 {
                 f.performance.append(PerformanceSample(source: record.source, model: record.model, timestamp: record.timestamp,
                                                        context: u.ctx, output: u.out, cacheRead: u.cacheRead, timing: record.timing))
@@ -1987,12 +2269,15 @@ public final class UsageHistory {
                 cost: record.billed.map { (value: $0.value, currency: $0.currency) } ?? engine.cost(model: record.model, ctx: u.ctx, cacheRead: u.cacheRead, cacheWrite: u.cacheWrite,
                                   cacheWrite1h: record.cw1h ?? 0, out: u.out, tier: record.tier, at: Date(timeIntervalSince1970: record.timestamp)))
         }
-        return f
+        return FileBuild(summary: f, points: points)
     }
 
     // MARK: - 汇总
 
     private func summarize() -> Snapshot {
+        let clock = { Date().timeIntervalSinceReferenceDate }
+        let summaryStart = clock()
+        let fileStart = benchFileSummary
         var result = Snapshot()
         let engine = pricing()
         defer { errors.formUnion(pricingWarnings) }
@@ -2021,11 +2306,36 @@ public final class UsageHistory {
             } else { codexWinner[key] = path }
         }
         let codexKeep = Set(codexWinner.values)
-        if summaryDirty.contains(where: { cache.files[$0].map { Self.kind(of: $0.source) == .claude } ?? false }) {
-            for (path, state) in cache.files where Self.kind(of: state.source) == .claude { fileSummaries[path] = nil }
+        // Claude 跨文件按 requestId 去重：只有归属真正变了的那几个文件才需要重算。
+        // 旧的「任一 Claude 文件有新记录 → 清空全部 Claude 摘要」在活跃会话下每 2 分钟重放上千个文件。
+        let dirtyClaude = summaryDirty.filter { cache.files[$0].map { Self.kind(of: $0.source) == .claude } ?? false }
+        if fileSummaries.count > cache.files.count {
+            // Long-running menu apps also drop logs; summaries for removed logs would otherwise stay resident.
+            let stale = fileSummaries.keys.filter { cache.files[$0] == nil }
+            for path in stale { fileSummaries[path] = nil }
         }
-        let needsClaude = cache.files.contains { path, state in Self.kind(of: state.source) == .claude && fileSummaries[path] == nil }
-        let winners = needsClaude ? claudeWinners() : [:]
+        let winnerStart = clock()
+        var winners: [String: [String: (path: String, record: Record)]] = [:]
+        if !dirtyClaude.isEmpty || cache.files.contains(where: { path, state in
+            Self.kind(of: state.source) == .claude && fileSummaries[path] == nil
+        }) {
+            winners = claudeWinners()
+            let newPaths = Self.winnerPaths(winners)
+            for (source, new) in newPaths {
+                let old = claudeWinnerPaths[source] ?? [:]
+                for (id, path) in new where old[id] != path {
+                    fileSummaries[path] = nil
+                    if let previous = old[id] { fileSummaries[previous] = nil }
+                }
+                for (id, path) in old where new[id] == nil { fileSummaries[path] = nil }
+            }
+            for (source, old) in claudeWinnerPaths where newPaths[source] == nil {
+                for (_, path) in old { fileSummaries[path] = nil }
+            }
+            claudeWinnerPaths = newPaths
+        }
+        let winnerTime = clock() - winnerStart
+        benchWinnerScan += winnerTime
         func addHourly(_ source: String, _ currency: String, _ day: String, _ hours: [Double]) {
             if hourly[currency]?[day] == nil { hourly[currency, default: [:]][day] = Array(repeating: 0, count: 24) }
             let device = Self.device(of: source).map { "remote:\($0)" } ?? "local"
@@ -2038,14 +2348,78 @@ public final class UsageHistory {
             }
             if day == todayKey { result.todayCostBySource[source, default: [:]][currency, default: 0] += hours.reduce(0, +) }
         }
+        // Build/refresh only the summaries that are dirty, missing, or have no ledger range yet. Points are
+        // kept transiently in `pendingPoints` instead of inside FileSummary, so unchanged files contribute
+        // their slice of the previous ledger and the process holds only one full ledger.
+        var pendingPoints: [String: [AccountUsagePoint]] = [:]
+        for (path, state) in cache.files {
+            if Self.kind(of: state.source) == .codex, !codexKeep.contains(path) { continue }
+            if summaryDirty.contains(path) { fileSummaries[path] = nil }
+            guard fileSummaries[path] == nil || accountLedgerRanges[path] == nil else { continue }
+            let fileSummaryStart = clock()
+            let built = summarizeFile(path, state: state, engine: engine, claudeWinners: winners, now: now.timeIntervalSince1970)
+            fileSummaries[path] = built.summary
+            pendingPoints[path] = built.points
+            benchFileSummary += clock() - fileSummaryStart
+        }
+        var pointReserve = 0
+        for (path, state) in cache.files {
+            // Skipped Codex archive copies never reach the ledger; counting them over-reserved the array by ~50%.
+            if Self.kind(of: state.source) == .codex, !codexKeep.contains(path) { continue }
+            if let points = pendingPoints[path] { pointReserve += points.count }
+            else if let range = accountLedgerRanges[path] { pointReserve += range.count }
+        }
+        // When no file produced points, every range still describes the same slice. Reuse the ledger by
+        // reference (Array is COW) instead of copying ~700k points into a second 168 MB buffer.
+        let activePaths = Set(cache.files.keys.filter { path in
+            Self.kind(of: cache.files[path]!.source) != .codex || codexKeep.contains(path)
+        })
+        let reuseLedger = pendingPoints.isEmpty && accountLedgerRanges.keys.allSatisfy { activePaths.contains($0) }
+            && activePaths.count == accountLedgerRanges.count
+        var newLedger: [AccountUsagePoint] = []
+        var newRanges: [String: Range<Int>] = [:]
+        if reuseLedger {
+            newLedger = ledgerStore.points
+            newRanges = accountLedgerRanges
+        } else {
+            newLedger.reserveCapacity(pointReserve)
+            newRanges.reserveCapacity(cache.files.count)
+        }
+        // Unchanged files come from an already-folded ledger, so no hashing is needed unless a file changed.
+        // Cross-device exact-request dedup still has to fold the new points against existing ones, so run the
+        // merge whenever any file produced new points.
+        let needsFold = !pendingPoints.isEmpty
+        var droppedPoints: [AccountUsagePoint] = []
+        var pointIndices: [AccountUsage.DedupKey: Int] = [:]
+        if needsFold { pointIndices.reserveCapacity(pointReserve / 2) }
         for (path, state) in cache.files {
             if Self.kind(of: state.source) == .codex, !codexKeep.contains(path) { continue }
             result.skippedRecords += state.skipped
             if state.hasUsageRecords != true { result.replayedTurns += state.replayed ?? 0 }
-            if summaryDirty.contains(path) { fileSummaries[path] = nil }
-            if fileSummaries[path] == nil { fileSummaries[path] = summarizeFile(path, state: state, engine: engine, claudeWinners: winners, now: now.timeIntervalSince1970) }
+            if !reuseLedger {
+                let ledgerStart = newLedger.count
+                if let points = pendingPoints.removeValue(forKey: path) {
+                    if needsFold {
+                        AccountUsage.merge(points, into: &newLedger, indices: &pointIndices, duplicates: &droppedPoints)
+                    } else {
+                        newLedger.append(contentsOf: points)
+                    }
+                } else if let range = accountLedgerRanges[path] {
+                    if needsFold {
+                        AccountUsage.merge(ledgerStore.points[range], into: &newLedger,
+                                           indices: &pointIndices, duplicates: &droppedPoints)
+                    } else {
+                        newLedger.append(contentsOf: ledgerStore.points[range])
+                    }
+                } else {
+                    // Defensive: a summary exists but its ledger slice is gone (should not happen after the prepass).
+                    let built = summarizeFile(path, state: state, engine: engine, claudeWinners: winners, now: now.timeIntervalSince1970)
+                    fileSummaries[path] = built.summary
+                    newLedger.append(contentsOf: built.points)
+                }
+                newRanges[path] = ledgerStart..<newLedger.count
+            }
             let f = fileSummaries[path]!
-            result.accountUsage.points.append(contentsOf: f.accountPoints)
             result.turnLatencies.append(contentsOf: state.turnLatencies ?? [])
             result.performance.append(contentsOf: f.performance.filter { $0.timestamp >= now.timeIntervalSince1970 - 86400 && $0.timestamp <= now.timeIntervalSince1970 })
             for sample in f.performance where sample.timestamp <= now.timeIntervalSince1970 {
@@ -2075,6 +2449,13 @@ public final class UsageHistory {
             for (model, costs) in f.costByModel {
                 for (currency, value) in costs { result.costByModel[model, default: [:]][currency, default: 0] += value }
             }
+            for (day, sources) in f.modelUsage {
+                for (source, models) in sources {
+                    for (model, use) in models {
+                        result.modelUsageDays[day, default: [:]][source, default: [:]][model, default: ModelUse()].merge(use)
+                    }
+                }
+            }
             for (source, currencies) in f.hourly {
                 for (currency, days) in currencies {
                     for (day, hours) in days where day > horizonDay { addHourly(source, currency, day, hours) }
@@ -2102,13 +2483,50 @@ public final class UsageHistory {
             }
         }
         // 每个来源/模型只发布最近 500 个数字样本，刷新仍由原有历史扫描驱动。
+        let mergeEnd = clock()
+        let fileTime = benchFileSummary - fileStart
+        benchMerge += (mergeEnd - summaryStart) - fileTime - winnerTime
         var sampleCounts: [String: Int] = [:]
         result.performance = result.performance.filter { $0.speed != nil || $0.timing?.ttftMS != nil }.sorted { $0.timestamp > $1.timestamp }.filter { sample in
             let key = sample.source + "|" + sample.model
             sampleCounts[key, default: 0] += 1
             return sampleCounts[key]! <= 500
         }
-        result.accountUsage = AccountUsageSnapshot.aggregate(points: result.accountUsage.points, now: now, calendar: .current)
+        let aggregateStart = clock()
+        benchDuplicates = droppedPoints.count
+        accountLedgerRanges = newRanges
+        if historicalBuiltGeneration != frozenGeneration {
+            let builderStart = clock()
+            var builder = AccountUsage.HistoricalGroupBuilder()
+            for (path, state) in cache.files {
+                if Self.kind(of: state.source) == .codex, !codexKeep.contains(path) { continue }
+                for bucket in state.frozen ?? [] {
+                    let cost = frozenEquivalentCost(bucket, engine: engine)
+                    builder.add(AccountUsagePoint(timestamp: bucket.timestamp, source: bucket.source, model: bucket.model,
+                        account: bucket.account, pool: AccountUsage.pool(model: bucket.model, source: bucket.source),
+                        usage: bucket.usage, requests: bucket.turns, cost: cost,
+                        unpricedRequests: cost == nil ? bucket.turns : 0, exactRequestID: bucket.exactRequestID,
+                        origin: Self.origin(of: bucket.source),
+                        timestampResolution: bucket.exactRequestID == nil && bucket.timestamp < now.timeIntervalSince1970 - Self.forecastWindow ? 3600 : 0))
+                }
+            }
+            let built = builder.finish()
+            historicalGroups = built.groups
+            historicalUnassigned = built.unassigned
+            historicalBuiltGeneration = frozenGeneration
+            log.notice("历史分组重建：\(built.groups.count) 组，\(Int((clock() - builderStart) * 1000)) ms")
+        }
+        // reserveCapacity used a conservative upper bound; copying to the exact count releases the spare
+        // capacity (the live array measured 218 MB for ~150 MB of points).
+        if newLedger.capacity > newLedger.count {
+            newLedger = Array(newLedger[0..<newLedger.count])
+        }
+        ledgerStore.points = newLedger
+        result.accountUsage = AccountUsageSnapshot.aggregate(points: newLedger, duplicates: droppedPoints,
+                                                               alreadyDeduplicated: true, now: now, calendar: .current)
+        result.accountUsage.mergeHistorical(historicalGroups, unassigned: historicalUnassigned)
+        result.accountUsage.ledger = ledgerStore
+        benchAggregate += clock() - aggregateStart
         for group in result.accountUsage.groups {
             guard let account = group.account else { continue }
             let markers = (cache.accountCoverage ?? [:]).values.filter { $0.accountKey == account.key }

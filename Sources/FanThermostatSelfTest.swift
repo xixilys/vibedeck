@@ -149,7 +149,7 @@ enum FanThermostatSelfTest {
         checkReadCoalescing()
         checkCommandOrder()
         checkBlockedTelemetry()
-        print("Fan thermostat self-tests passed (PI replay, monotonic watchdog/retry, native emergency hold, async quit, read coalescing, ACK ordering independent of blocked telemetry)")
+        print("Fan thermostat self-tests passed (PI replay, monotonic watchdog/retry, self-owned full-speed emergency, async quit, read coalescing, ACK ordering independent of blocked telemetry)")
     }
 
     private static func checkModeFences() {
@@ -196,7 +196,8 @@ enum FanThermostatSelfTest {
     private static func checkRecovery() {
         let meanOnly = Fixture()
         meanOnly.tick(nil, mean: 62)
-        precondition(meanOnly.autos.count == 1 && meanOnly.reads.isEmpty, "Mean temperature must not masquerade as hottest-core input")
+        precondition(meanOnly.autos.isEmpty && meanOnly.reads.isEmpty && meanOnly.thermostat.phase == .sensorLost,
+                     "Mean temperature must not masquerade as hottest-core input")
 
         let native = Fixture()
         native.tick()
@@ -209,23 +210,22 @@ enum FanThermostatSelfTest {
         let missing = Fixture()
         missing.connect(); missing.acknowledgeManual()
         missing.tick(nil, mean: nil)
-        precondition(missing.autos.count == 1)
-        missing.acknowledgeAuto()
+        precondition(missing.autos.isEmpty && missing.thermostat.phase == .sensorLost)
         missing.tick(nil, mean: nil)
-        precondition(missing.autos.isEmpty && missing.thermostat.phase == .systemAutomatic)
+        precondition(missing.autos.isEmpty && missing.thermostat.commandedRPM == 3000,
+                     "A lost sensor keeps the last commanded speed instead of handing cooling to macOS")
         missing.tick()
-        precondition(missing.reads.isEmpty, "Do not bounce directly from Auto back to Manual")
-        for _ in 0..<6 { missing.tick() }
-        precondition(missing.reads.count == 1, "Recover only after 30 seconds of fresh observations")
+        precondition(missing.reads.isEmpty && missing.autos.isEmpty,
+                     "A returning sensor resumes the thermostat without reloading the range")
 
         for invalid in [Double.nan, Double.infinity, -1, 126] {
             let fixture = Fixture()
             fixture.tick(invalid)
-            precondition(fixture.autos.count == 1 && fixture.reads.isEmpty)
+            precondition(fixture.autos.isEmpty && fixture.reads.isEmpty && fixture.thermostat.phase == .sensorLost)
         }
         let stale = Fixture()
         stale.tick(age: 31)
-        precondition(stale.autos.count == 1 && stale.reads.isEmpty)
+        precondition(stale.autos.isEmpty && stale.reads.isEmpty && stale.thermostat.phase == .sensorLost)
 
         let disabled = Fixture()
         disabled.thermostat.setEnabled(false)
@@ -256,10 +256,10 @@ enum FanThermostatSelfTest {
         _ = noMoreSamples.thermostat
         noMoreSamples.wallOffset = -3600 // Wall-clock changes do not postpone liveness.
         noMoreSamples.clock.advance(30)
-        precondition(noMoreSamples.autos.count == 1)
-        noMoreSamples.acknowledgeAuto()
+        precondition(noMoreSamples.autos.isEmpty, "A missing temperature holds the fan instead of handing it to macOS")
+        precondition(noMoreSamples.thermostat.phase == .sensorLost)
         noMoreSamples.clock.advance(120)
-        precondition(noMoreSamples.autos.isEmpty && noMoreSamples.clock.liveJobs == 0)
+        precondition(noMoreSamples.autos.isEmpty && noMoreSamples.thermostat.phase == .sensorLost)
 
         let stalledRange = Fixture()
         stalledRange.tick()
@@ -291,19 +291,19 @@ enum FanThermostatSelfTest {
         let hot = Fixture()
         hot.connect(); hot.acknowledgeManual()
         hot.tick(105)
-        precondition(hot.autos.count == 1 && hot.manuals.isEmpty, "Raw emergency bypasses the still-cool filter")
-        hot.acknowledgeAuto()
+        precondition(hot.autos.isEmpty && hot.manuals.count == 1,
+                     "An emergency ramps the fan itself instead of handing cooling to macOS")
+        precondition(hot.manuals.first?.0 == Int(fan.maximumRPM), "Emergency commands full speed")
+        hot.acknowledgeManual()
+        precondition(hot.thermostat.commandedRPM == Int(fan.maximumRPM) && hot.thermostat.phase == .emergency)
         for _ in 0..<6 { hot.tick(105) }
-        precondition(hot.autos.isEmpty && hot.reads.isEmpty, "Repeated hot samples remain on native Auto without command chatter")
-        hot.tick(86) // Above the 85° recovery threshold for target75.
-        precondition(hot.reads.isEmpty)
-        var recovered = false
-        for _ in 0..<24 {
-            hot.tick(75)
-            if !hot.reads.isEmpty { recovered = true; break }
-        }
-        precondition(recovered && hot.reads.count == 1 && hot.autos.isEmpty)
-        precondition(hot.thermostat.target == 75)
+        precondition(hot.manuals.isEmpty && hot.reads.isEmpty, "Repeated hot samples keep full speed without command chatter")
+        hot.tick(86) // Above the 83° release ceiling for target 75.
+        precondition(hot.manuals.isEmpty && hot.thermostat.phase == .emergency)
+        for _ in 0..<10 { hot.tick(75) }
+        precondition(hot.thermostat.phase != .emergency && hot.thermostat.commandedRPM == Int(fan.maximumRPM),
+                     "Full speed is released only after 30 seconds below the ceiling")
+        precondition(hot.autos.isEmpty && hot.reads.isEmpty && hot.thermostat.target == 75)
     }
 
     private static func checkQuit() {

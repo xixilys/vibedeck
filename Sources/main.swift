@@ -125,7 +125,281 @@ if CommandLine.arguments.contains("--debug-usage") {
     for (source, t) in h.todayBySource.sorted(by: { $0.key < $1.key }) { print("  \(source): \(t.tokenTotal) tok · \(t.turns) turns") }
     print("== all-time totals by source")
     for (source, t) in h.totals.sorted(by: { $0.key < $1.key }) { print("  \(source): \(t.tokenTotal) tok · \(t.turns) turns · \(h.costBySource[source] ?? [:])") }
+    print("== today by model (API-equivalent)")
+    let todayKey = UsageHistory.dayKey(timestamp: now)
+    var byModel: [String: (tokens: Int64, requests: Int, cost: [String: Double], sources: Set<String>)] = [:]
+    for (source, models) in h.modelUsageDays[todayKey] ?? [:] {
+        for (model, use) in models {
+            var row = byModel[model] ?? (0, 0, [:], [])
+            row.tokens += use.usage.tokenTotal; row.requests += use.requests
+            row.sources.insert(source)
+            for (currency, value) in use.costByCurrency { row.cost[currency, default: 0] += value }
+            byModel[model] = row
+        }
+    }
+    for (model, row) in byModel.sorted(by: { $0.value.tokens > $1.value.tokens }).prefix(20) {
+        print("  \(model): \(row.tokens) tok · \(row.requests) req · \(row.cost) · \(row.sources.sorted().joined(separator: ", "))")
+    }
     print("notes:", h.sourceNotes, "error:", h.error)
+    exit(0)
+}
+
+// `VibeDeck --bench-history [scans]`：不开 UI，对一份缓存副本跑 N 次历史扫描并打印各阶段耗时。
+// 用法：VIBEGAUGE_HISTORY_CACHE=/tmp/vgbench/usage-daily.json VibeDeck.app/Contents/MacOS/VibeDeck --bench-history 2
+if CommandLine.arguments.contains("--bench-history") {
+    let scans = max(1, CommandLine.arguments.compactMap { Int($0) }.first ?? 2)
+    let cache = ProcessInfo.processInfo.environment["VIBEGAUGE_HISTORY_CACHE"]
+        ?? "\(FileManager.default.homeDirectoryForCurrentUser.path)/.config/vibedeck/usage-daily.json"
+    print("cache: \(cache)  scans: \(scans)")
+    let history = UsageHistory(cachePath: cache)
+    func footprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
+    }
+    for index in 0..<scans {
+        let started = Date()
+        var cpuBefore = rusage()
+        getrusage(RUSAGE_SELF, &cpuBefore)
+        history.refreshNow()
+        let snap = history.snapshot()
+        let b = history.benchmark
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        let wall = Date().timeIntervalSince(started)
+        let cpu = { (u: rusage) in Double(u.ru_utime.tv_sec + u.ru_stime.tv_sec) + Double(u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1_000_000 }
+        print(String(format: "scan %d/%d  wall %.2fs  cpu %.2fs  maxrss %.0f MB", index + 1, scans, wall,
+                     cpu(usage) - cpu(cpuBefore), Double(usage.ru_maxrss) / 1_048_576))
+        print(String(format: "  phases: load %.2f  discover %.2f  process %.2f  ingest %.2f  remote %.2f  freeze %.2f  snapshot %.2f",
+                     b?.loadCache ?? 0, b?.discoverFiles ?? 0, b?.processFiles ?? 0, b?.ingest ?? 0, b?.remote ?? 0, b?.freeze ?? 0, b?.snapshot ?? 0))
+        print(String(format: "  pricing %.2f", b?.pricing ?? 0))
+        print(String(format: "  summary: winners %.2f  files %.2f  merge %.2f  aggregate %.2f",
+                     b?.winnerScan ?? 0, b?.fileSummary ?? 0, b?.merge ?? 0, b?.aggregate ?? 0))
+        print("  data: files \(b?.files ?? 0)  summaries \(b?.fileSummaries ?? 0)  records \(b?.records ?? 0)  frozen \(b?.frozenBuckets ?? 0)  points \(b?.points ?? 0)  identified \(b?.identified ?? 0)  duplicates \(b?.duplicates ?? 0)  groups \(b?.groups ?? 0)  days \(snap.days.count)")
+        let nowTS = Date().timeIntervalSince1970
+        let ages = snap.accountUsage.points.map { (nowTS - $0.timestamp) / 86400 }
+        let le7 = ages.filter { $0 < 7 }.count
+        let le35 = ages.filter { $0 < 35 }.count
+        let le90 = ages.filter { $0 < 90 }.count
+        print("  point age days: <=7d \(le7)  <=35d \(le35)  <=90d \(le90)  total \(ages.count)  stride \(MemoryLayout<AccountUsagePoint>.stride)B")
+    }
+    malloc_zone_pressure_relief(nil, 0)
+    print(String(format: "resident footprint after relief: %.1f MB", footprintMB()))
+    if let hold = Int(ProcessInfo.processInfo.environment["VG_BENCH_HOLD"] ?? ""), hold > 0 {
+        print("pid \(getpid()) holding \(hold)s")
+        fflush(stdout)
+        sleep(UInt32(hold))
+    }
+    exit(0)
+}
+
+// `VibeDeck --bench-process [n]`：顺序跑 n 次后台巡检，逐次打印 CPU，用来定位扫描本身的成本。
+if CommandLine.arguments.contains("--bench-process") {
+    let scans = max(1, CommandLine.arguments.compactMap { Int($0) }.first ?? 3)
+    let forceSlow = CommandLine.arguments.contains("slow")
+    let cpu = { (u: rusage) in Double(u.ru_utime.tv_sec + u.ru_stime.tv_sec) + Double(u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1_000_000 }
+    for index in 0..<scans {
+        var before = rusage()
+        getrusage(RUSAGE_SELF, &before)
+        let started = Date()
+        let report = ProcessScanner.shared.scan(refreshRemote: false, panelVisible: false, forceSlow: forceSlow)
+        var after = rusage()
+        getrusage(RUSAGE_SELF, &after)
+        print(String(format: "process scan %d/%d  wall %.2fs  cpu %.2fs  orphans %d  mcp %d  llms %d",
+                     index + 1, scans, Date().timeIntervalSince(started), cpu(after) - cpu(before),
+                     report.orphans.count, report.activeMCPProcessCount, report.detectedLLMs.count))
+        if forceSlow {
+            let profile = ProcessScanner.shared.lastSlowProfile.sorted { $0.key < $1.key }
+                .map { String(format: "%@ %.2f", $0.key, $0.value) }.joined(separator: "  ")
+            print("  slow profile: \(profile)")
+        }
+    }
+    exit(0)
+}
+
+// `VibeDeck --bench-live [seconds]`：后台按菜单栏的真实节奏跑一遍采集，不开 UI，打印 CPU/内存。
+// 用 VG_BENCH_SKIP=history,network,process,system,monitors 逐项排除，定位是哪一路在耗电。
+if CommandLine.arguments.contains("--bench-live") {
+    let seconds = max(5.0, Double(ProcessInfo.processInfo.environment["VG_BENCH_SECONDS"] ?? "") ?? 60)
+    let skip = Set((ProcessInfo.processInfo.environment["VG_BENCH_SKIP"] ?? "").split(separator: ",").map(String.init))
+    let cpu = { (u: rusage) in Double(u.ru_utime.tv_sec + u.ru_stime.tv_sec) + Double(u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1_000_000 }
+    print("bench-live \(Int(seconds))s  skip=\(skip.sorted().joined(separator: ","))")
+    if !skip.contains("network") { NetworkScanner.shared.start() }
+    if !skip.contains("system") { SystemMonitor.shared.start() }
+    if !skip.contains("history") { UsageHistory.shared.start() }
+    if !skip.contains("monitors") {
+        ExternalDiskMonitor.shared.start()
+        VM2APIQuotaStore.shared.start()
+        NerfDetector.shared.start()
+        ExchangeRates.shared.refreshIfNeeded()
+    }
+    var processScanInFlight = false
+    if !skip.contains("process") {
+        let timer = Timer(timeInterval: 8, repeats: true) { _ in
+            guard !processScanInFlight else { return }
+            processScanInFlight = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = ProcessScanner.shared.scan(refreshRemote: false, panelVisible: false)
+                processScanInFlight = false
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+    }
+    // 冷启动的首扫/首次探测可达 30 s CPU；先让它们跑完，再测量稳定态，否则平均值全是冷启动。
+    let warmup = max(10, Int(ProcessInfo.processInfo.environment["VG_BENCH_WARMUP"] ?? "") ?? 60)
+    print("warmup \(warmup)s")
+    RunLoop.current.run(until: Date().addingTimeInterval(Double(warmup)))
+    var before = rusage()
+    getrusage(RUSAGE_SELF, &before)
+    RunLoop.current.run(until: Date().addingTimeInterval(seconds))
+    var after = rusage()
+    getrusage(RUSAGE_SELF, &after)
+    let wall = seconds
+    print(String(format: "bench-live done: avg CPU %.1f%%  cpu %.2fs / %.0fs  maxrss %.0f MB",
+                 100 * (cpu(after) - cpu(before)) / wall, cpu(after) - cpu(before), wall,
+                 Double(after.ru_maxrss) / 1_048_576))
+    if !skip.contains("history") {
+        let snap = UsageHistory.shared.snapshot()
+        print("history: points \(snap.accountUsage.points.count) scanning \(snap.isScanning) captured \(Int(snap.capturedAt))")
+    }
+    exit(0)
+}
+
+// `VibeDeck --debug-vm2api`：真实走一次 jp-elaina 的 Codex 额度缓存 + Claude 账号库，打印解析结果。
+// `--debug-claude-vm` 保留为兼容别名。
+if CommandLine.arguments.contains("--debug-vm2api") || CommandLine.arguments.contains("--debug-claude-vm") {
+    _ = NSApplication.shared
+    let store = VM2APIQuotaStore.shared
+    store.refreshIfNeeded(force: true)
+    var waited = 0.0
+    while store.snapshot.attemptedAt == 0 && waited < 30 {
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1)); waited += 0.1
+    }
+    print("hosts:", VM2APIQuota.configuredHosts())
+    print("codex:", VM2APIQuota.configuredCodexPath(), "db:", VM2APIQuota.configuredDBPath())
+    print("error:", store.snapshot.error.isEmpty ? "—" : store.snapshot.error)
+    if !store.snapshot.claudeError.isEmpty { print("claude error:", store.snapshot.claudeError) }
+    if !store.snapshot.codexError.isEmpty { print("codex error:", store.snapshot.codexError) }
+    for account in store.snapshot.accounts {
+        func window(_ q: QuotaWindow?) -> String {
+            guard let q else { return "—" }
+            return "\(q.usedPct)% reset=\(q.resetsAt.map { String(format: "%.0f", $0) } ?? "?") captured=\(q.capturedAt.map { String(format: "%.0f", $0) } ?? "?")"
+        }
+        print("  \(account.title) 5h=\(window(account.fiveHour)) week=\(window(account.sevenDay)) note=\(account.note)")
+        let samples = store.history[account.id] ?? [:]
+        print("    history 5h=\(samples["5h"]?.count ?? 0) week=\(samples["week"]?.count ?? 0)")
+    }
+    exit(0)
+}
+
+// `VibeDeck --debug-disks`: mounted external volumes with the same parser the System tile uses.
+if CommandLine.arguments.contains("--debug-disks") {
+    ExternalDiskMonitor.shared.refreshSynchronously()
+    for disk in ExternalDiskMonitor.shared.disks {
+        print("\(disk.volumeName) [\(disk.bsdName)/\(disk.wholeDisk)] \(disk.model) \(disk.mediaLabel) \(disk.protocolName) "
+              + "SMART=\(disk.smartStatus) used=\(String(format: "%.1f", disk.usedFraction * 100))% "
+              + "free=\(String(format: "%.1f", Double(disk.freeBytes) / 1_000_000_000))GB total=\(String(format: "%.1f", Double(disk.totalBytes) / 1_000_000_000))GB mount=\(disk.mountPath)")
+    }
+    if ExternalDiskMonitor.shared.disks.isEmpty { print("no external volumes") }
+    if !ExternalDiskMonitor.shared.error.isEmpty { print("error:", ExternalDiskMonitor.shared.error) }
+    exit(0)
+}
+
+// `VibeDeck --debug-quota`：用真实账本打印每个额度窗口的「已用 / 满额」估算，排查估算为什么缺失或不稳。
+if CommandLine.arguments.contains("--debug-quota") {
+    _ = NSApplication.shared
+    UsageHistory.shared.start()
+    var waited = 0.0
+    while (UsageHistory.shared.snapshot().capturedAt == 0 || UsageHistory.shared.snapshot().isScanning) && waited < 400 {
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.5)); waited += 0.5
+    }
+    let history = UsageHistory.shared.snapshot()
+    let store = AccountCycleStore(path: FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".config/vibedeck/account-cycles.json").path)
+    let evidence = store.perSourceObservations
+    let now = Date().timeIntervalSince1970
+    let points = history.accountUsage.points
+    func money(_ values: [String: Double], digits: Int) -> String {
+        values.keys.sorted().map { key in key + " " + String(format: "%.\(digits)f", values[key]!) }.joined(separator: " + ")
+    }
+    func report(_ label: String, _ quotas: [AccountQuotaObservation], coverage: TimeInterval?,
+                points cardPoints: [AccountUsagePoint]) {
+        let started = Date()
+        let values = AccountUsage.windowValues(quotas: quotas, points: cardPoints, coverageStart: coverage,
+                                               alreadyDeduplicated: true, now: now)
+        let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+        defer { print("     · \(cardPoints.count) points, \(elapsed) ms") }
+        for value in values.values.sorted(by: { ($0.pool, $0.window) < ($1.pool, $1.window) }) {
+            let consumed = value.consumedByCurrency.isEmpty ? "—" : money(value.consumedByCurrency, digits: 2)
+            let capacity = value.hasCapacity ? money(value.capacityByCurrency, digits: 0) : "—"
+            let planes = value.consumedByOrigin.keys.sorted().map { $0 + " " + money(value.consumedByOrigin[$0] ?? [:], digits: 2) }.joined(separator: " + ")
+            print("  \(label) · \(value.pool)/\(value.window): used \(String(format: "%.0f", value.usedPercent))%"
+                  + " · consumed \(consumed) (\(value.consumedRequests) req, \(value.unpricedRequests) unpriced)"
+                  + "\(planes.isEmpty ? "" : " [" + planes + "]") · full \(capacity) via \(value.basis.isEmpty ? "—" : value.basis)"
+                  + " [\(value.origin), samples \(value.samples)], covered \(value.covered)")
+        }
+    }
+    var identities: [String: AccountIdentity] = [:]
+    for q in evidence { if let account = q.account { identities[account.key] = account } }
+    print("== per account (\(evidence.count) per-source observations, \(points.count) ledger points)")
+    for account in identities.values.sorted(by: { $0.key < $1.key }) {
+        let quotas = evidence.filter { $0.account == account }
+        let sources = Set(quotas.map(\.source))
+        let relevant = points.filter { $0.account == account || ($0.account == nil && sources.contains($0.source)) }
+        report(String(account.accountID.suffix(8)), quotas,
+               coverage: history.accountUsage.coverageStartByAccount[account.key], points: relevant)
+    }
+    print("== anonymous (plan) pools")
+    let anonymous = evidence.filter { $0.account == nil }
+    let anonymousPoints = points.filter { $0.account == nil }
+    for pool in Set(anonymous.map(\.pool)).sorted() {
+        let quotas = anonymous.filter { $0.pool == pool }
+        let relevant = anonymousPoints.filter { $0.pool == pool || UsageHistory.cli(of: $0.source).lowercased() == pool }
+        report(pool, quotas, coverage: nil, points: relevant)
+    }
+    print("== ledger points by source (all time / today)")
+    let bySource = Dictionary(grouping: points, by: \.source)
+    for (source, rows) in bySource.sorted(by: { $0.key < $1.key }) {
+        let todayRows = rows.filter { $0.timestamp >= now - 86400 }
+        print("  \(source): \(rows.count) / \(todayRows.count)  account=nil \(rows.filter { $0.account == nil }.count)")
+    }
+    print("== account groups")
+    for group in history.accountUsage.groups {
+        let sources = group.bySource.keys.sorted().joined(separator: ", ")
+        print("  \(group.account?.provider ?? "-")|\(group.account?.accountID.suffix(8) ?? "-"): "
+              + "\(group.totals.requests) req · \(group.totals.usage.tokenTotal) tok · sources [\(sources)]")
+    }
+    print("== today points per source by account")
+    let todayStart0 = Calendar.current.startOfDay(for: Date(timeIntervalSince1970: now)).timeIntervalSince1970
+    for (source, rows) in Dictionary(grouping: points.filter { $0.timestamp >= todayStart0 }, by: \.source).sorted(by: { $0.key < $1.key }) {
+        let byAccount = Dictionary(grouping: rows, by: { $0.account.map { $0.provider + "|" + $0.accountID.suffix(8) } ?? "nil" })
+        let parts = byAccount.sorted { $0.key < $1.key }.map { "\($0.key)=$0.value.count".replacingOccurrences(of: "$0.value.count", with: String($0.value.count)) }
+        print("  \(source): \(parts.joined(separator: " · "))")
+    }
+    let todayStart = todayStart0
+    print("== today by source/pool, all points (window-independent)")
+    for account in identities.values.sorted(by: { $0.key < $1.key }) {
+        let todayPoints = points.filter { $0.timestamp >= todayStart && ($0.account == account) }
+        let grouped = Dictionary(grouping: todayPoints, by: { "\($0.source) | \($0.pool) | \($0.origin)" })
+        for (groupKey, group) in grouped.sorted(by: { $0.key < $1.key }) {
+            let usd = group.reduce(0.0) { $0 + ($1.equivalentCostByCurrency["USD"] ?? 0) }
+            let cny = group.reduce(0.0) { $0 + ($1.equivalentCostByCurrency["CNY"] ?? 0) }
+            print("  \(String(account.accountID.suffix(8))) \(groupKey): \(group.count) pts, USD \(String(format: "%.2f", usd))"
+                  + (cny > 0 ? " CNY \(String(format: "%.2f", cny))" : ""))
+        }
+    }
+    print("== today unassigned/other points by source/pool")
+    let orphanToday = points.filter { $0.timestamp >= todayStart && $0.account == nil }
+    for (groupKey, group) in Dictionary(grouping: orphanToday, by: { "\($0.source) | \($0.pool)" }).sorted(by: { $0.key < $1.key }) {
+        let usd = group.reduce(0.0) { $0 + ($1.equivalentCostByCurrency["USD"] ?? 0) }
+        print("  anon \(groupKey): \(group.count) pts, USD \(String(format: "%.2f", usd))")
+    }
+    print("== coverage markers:", history.accountUsage.coverageStartByAccount.mapValues { Int(now - $0) })
     exit(0)
 }
 
@@ -199,6 +473,7 @@ if let i = CommandLine.arguments.firstIndex(of: "--render-panel") {
     _ = NSApplication.shared
     NetworkScanner.shared.start()
     SystemMonitor.shared.start()
+    ExternalDiskMonitor.shared.refreshSynchronously()
     SystemMonitor.shared.setVisible(true)
     var report = ProcessScanner.shared.scan(refreshRemote: false)
     if CommandLine.arguments.contains("--live-devices") {
@@ -218,6 +493,11 @@ if let i = CommandLine.arguments.firstIndex(of: "--render-panel") {
         }
     }
     UsageHistory.shared.start()
+    VM2APIQuotaStore.shared.refreshIfNeeded(force: true)
+    var vmWait = 0.0
+    while VM2APIQuotaStore.shared.snapshot.attemptedAt == 0 && vmWait < 25 {
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.2)); vmWait += 0.2
+    }
     let liveDevices = CommandLine.arguments.contains("--live-devices")
     var waited = 0.0
     while (UsageHistory.shared.snapshot().capturedAt == 0 || (liveDevices && UsageHistory.shared.snapshot().isScanning) || NetworkScanner.shared.snapshot().capturedAt == 0) && waited < 300 {
@@ -230,7 +510,8 @@ if let i = CommandLine.arguments.firstIndex(of: "--render-panel") {
     }
     NerfDetector.shared.refreshNow(history: UsageHistory.shared.snapshot())
     let savedArguments = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
-    let pages: [(name: String, tab: Int, drill: String?)] = [("subscription", 0, nil), ("api", 1, nil), ("stats", 2, nil),
+    let pages: [(name: String, tab: Int, drill: String?)] = [("subscription", 0, nil), ("vm2api", 0, DashboardView.vm2apiPage),
+                                                             ("api", 1, nil), ("stats", 2, nil),
                                                              ("network", 3, nil), ("system", 4, nil), ("health", 0, DashboardView.healthPage),
                                                              ("prices", 0, DashboardView.pricesPage), ("settings", 0, DashboardView.settingsPage),
                                                              ("devices", 0, DashboardView.devicesPage)]
@@ -295,6 +576,25 @@ if CommandLine.arguments.contains("--selftest") {
     precondition(FanSMC.clampRPM(500, minimum: 1000, maximum: 4900) == 1000)
     precondition(FanSMC.clampRPM(2000, minimum: 1000, maximum: 4900) == 2000)
     precondition(FanSMC.clampRPM(6000, minimum: 1000, maximum: 4900) == 4900)
+    // Quota samples keep the week (周额度满额估算需要长跨度) at three densities.
+    do {
+        let now: TimeInterval = 1_800_000_000
+        let week = 7.0 * 24 * 3600
+        let samples = stride(from: 0.0, through: week, by: 60).map { (t: now - week + $0, pct: 1) }
+        let kept = ProcessScanner.downsample(samples, now: now)
+        let dense = kept.filter { now - $0.t <= 6 * 3600 }
+        let mid = kept.filter { now - $0.t > 6 * 3600 && now - $0.t <= 48 * 3600 }
+        let old = kept.filter { now - $0.t > 48 * 3600 }
+        precondition(kept.first?.t == samples.first?.t, "the baseline sample survives")
+        precondition(dense.count >= 350 && dense.count <= 365, "1-minute samples in the last 6 hours")
+        precondition(mid.count >= 250 && mid.count <= 255, "10-minute samples for 6–48 hours")
+        precondition(old.count >= 115 && old.count <= 122, "1-hour samples for 2–7 days")
+        precondition(kept.count < samples.count / 8, "layered retention keeps the file small")
+    }
+    // One stuck probe must not fake a 105° emergency; a genuinely hot CPU still reports its hottest core.
+    precondition(SystemMonitor.robustMax([60, 62, 64, 111]) == 64)
+    precondition(SystemMonitor.robustMax([100, 104, 106]) == 106)
+    precondition(SystemMonitor.robustMax([]) == nil)
     // stat(2) probe: same shape the scan needs, without the xattr lookup.
     do {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("vg-fileprobe-" + UUID().uuidString)
@@ -331,8 +631,8 @@ if CommandLine.arguments.contains("--selftest") {
     // Slow-layer scheduling uses a monotonic clock, and opening the panel restores 8s freshness.
     precondition(ProcessScanner.slowScanDue(last: nil, now: 0, panelVisible: false))
     precondition(!ProcessScanner.slowScanDue(last: 100, now: 108, panelVisible: false))
-    precondition(!ProcessScanner.slowScanDue(last: 100, now: 129.9, panelVisible: false))
-    precondition(ProcessScanner.slowScanDue(last: 100, now: 130, panelVisible: false))
+    precondition(!ProcessScanner.slowScanDue(last: 100, now: 159.9, panelVisible: false))
+    precondition(ProcessScanner.slowScanDue(last: 100, now: 160, panelVisible: false))
     precondition(ProcessScanner.slowScanDue(last: 100, now: 108, panelVisible: true))
     precondition(!ProcessScanner.slowScanDue(last: 100, now: 107.9, panelVisible: true))
     precondition(ProcessScanner.slowScanDue(last: 100, now: 101, panelVisible: false, force: true))
@@ -1172,6 +1472,26 @@ if CommandLine.arguments.contains("--selftest") {
     }
 
     PricingCatalog.normalizationSelfTest()
+    // Domestic rows stay CNY for the recorded bill but become USD for API-equivalent totals.
+    do {
+        let cny = ProcessScanner.PriceTable(json: ["_currency": "CNY", "fixture-domestic": ["in": 7, "out": 14]])
+        let engine = CostEngine(user: cny, catalog: PricingCatalog.builtin, usdPerCNY: 7)
+        let recorded = engine.cost(model: "fixture-domestic", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 0)!
+        precondition(recorded.currency == "CNY" && abs(recorded.value - 7) < 1e-9)
+        let equivalent = engine.equivalentCost(model: "fixture-domestic", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 0)!
+        precondition(equivalent.currency == "USD" && abs(equivalent.value - 1) < 1e-9)
+        let noRate = CostEngine(user: cny, catalog: PricingCatalog.builtin)
+        precondition(noRate.equivalentCost(model: "fixture-domestic", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 0)?.currency == "CNY")
+        // Provider-prefixed ids must still find a plain user row.
+        let prefixed = ProcessScanner.PriceTable(json: ["_currency": "CNY", "deepseek-flash": ["in": 2, "out": 8]])
+        precondition(prefixed.cost(model: "deepseek/deepseek-flash", ctx: 1_000_000, cacheRead: 0, cacheWrite: 0, out: 0) != nil,
+                     "user price rows normalise provider prefixes")
+        let glm = ProcessScanner.PriceTable(json: ["_currency": "USD", "glm-5.3": ["in": 8, "out": 28, "currency": "CNY"]])
+        precondition(glm.currency(for: "zhipu/glm-5.3") == "CNY", "per-row currency follows the normalised model")
+    }
+    VM2APIQuota.selfTest()
+    StatsTabView.selfTest()
+    ExternalDiskMonitor.selfTest()
     OverviewMetricPresentation.selfTest()
     AccountQuotaRingPresentation.selfTest()
     SystemNetworkCounters.selfTest()
@@ -1326,6 +1646,13 @@ if CommandLine.arguments.contains("--selftest") {
         precondition(PricingCatalog.entry(for: "gpt-6-sol") != nil && PricingCatalog.entry(for: "claude-opus-4-8") != nil)
         let sol61 = PricingCatalog.builtin.entries["gpt-6.1-sol"]!
         precondition(sol61.base.cacheRead == 0.1 && sol61.base.cacheWrite == 2.5)
+        // GPT-6.1 Terra: $1 in / $0.05 cached / $1.25 cache write / $5 out, 2x input + 1.5x output over 272K.
+        let terra61 = PricingCatalog.builtin.entries["gpt-6.1-terra"]!
+        precondition(terra61.base.input == 1 && terra61.base.output == 5 && terra61.base.cacheRead == 0.05,
+                     "gpt-6.1-terra 官方价")
+        precondition(abs(PricingCatalog.cost(terra61, ctx: 100_000, cacheRead: 50_000, cacheWrite: 0, out: 10_000) - 0.1025) < 1e-9)
+        precondition(abs(PricingCatalog.cost(terra61, ctx: 300_000, cacheRead: 100_000, cacheWrite: 0, out: 10_000) - 0.485) < 1e-9,
+                     "gpt-6.1-terra 超 272k 整单按长上下文价")
         precondition(abs(PricingCatalog.cost(sol61, ctx: 272001, cacheRead: 100000, cacheWrite: 50000, out: 10000, tier: "fast") - 1.816008) < 1e-9)
         precondition(PricingCatalog.entry(for: "gpt-5.3-codex-spark") == nil)
         let opus55 = PricingCatalog.builtin.entries["claude-opus-5-5"]!
